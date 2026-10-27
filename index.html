@@ -17,7 +17,7 @@ html.auth-checking .app,html.auth-required .app{display:none}.auth-screen{min-he
 <button class="navbtn active" data-page="works"><span class="ico">▦</span><span class="navtext">我的作品</span></button>
 <button class="navbtn" data-page="characters"><span class="ico">♙</span><span class="navtext">角色库</span></button>
 <button class="navbtn" data-page="workbench"><span class="ico">✎</span><span class="navtext">漫画工作台</span></button>
-<div class="side-bottom"><button class="secondary hidden" id="auth-logout" style="margin-bottom:10px">退出登录</button><b>本地创作空间</b>作品保存在当前浏览器<br>当前为演示模式 · 无需 API 密钥</div></aside>
+<div class="side-bottom"><button class="secondary hidden" id="auth-logout" style="margin-bottom:10px">退出登录</button><b>创作工作区</b>作品自动保存在服务端<br><span id="provider-mode">正在检查 AI 服务…</span></div></aside>
 <main class="main"><header class="topbar"><div class="crumb" id="breadcrumb">创作空间　/　我的作品</div><div class="topright"><span class="badge" id="ai-status">✦ AI 演示模式</span><div class="avatar">小</div></div></header>
 <section id="page-works"><div class="page-head"><div><div class="eyebrow">Your stories, made panel by panel</div><h1>我的作品</h1><p>把一个灵感，慢慢做成一篇漫画。</p></div><div style="display:flex;gap:8px"><button class="secondary" id="export-json">备份作品</button><button class="secondary" id="import-json">导入备份</button><input id="import-json-file" type="file" accept="application/json" hidden><button class="primary" id="new-work">＋ 新建漫画</button></div></div>
 <div class="stats"><div class="stat"><small>全部作品</small><strong id="stat-works">0</strong></div><div class="stat"><small>角色档案</small><strong id="stat-chars">0</strong></div><div class="stat"><small>最近导出</small><strong id="stat-export">—</strong></div></div>
