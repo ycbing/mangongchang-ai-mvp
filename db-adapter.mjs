@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
-import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 
@@ -62,17 +63,38 @@ export async function openDatabase({ databaseUrl, databasePath }) {
 }
 
 export async function applyPostgresMigrations(db, migrationsDir) {
-  await db.exec('CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)');
-  const file = resolve(migrationsDir, '001_initial.sql');
-  const sql = await readFile(file, 'utf8');
-  await db.transaction(async tx => {
-    const applied = await tx.prepare('SELECT version FROM schema_migrations WHERE version=?').get('001_initial');
-    if (applied) return;
-    await tx.exec?.(sql);
-    if (!tx.exec) {
-      // Statements in the migration contain no procedural blocks; send them individually.
-      for (const statement of sql.split(';').map(x => x.trim()).filter(Boolean)) await tx.prepare(statement).run();
+  const files = (await readdir(migrationsDir))
+    .filter(name => /^\d{3,}_[a-z0-9_-]+\.sql$/i.test(name))
+    .sort((a, b) => {
+      const left = BigInt(a.slice(0, a.indexOf('_'))), right = BigInt(b.slice(0, b.indexOf('_')));
+      return left < right ? -1 : left > right ? 1 : a < b ? -1 : a > b ? 1 : 0;
+    });
+  if (!files.length) throw new Error('PostgreSQL migration directory contains no versioned SQL files');
+  for (let i = 1; i < files.length; i++) {
+    if (files[i - 1].slice(0, files[i - 1].indexOf('_')) === files[i].slice(0, files[i].indexOf('_'))) {
+      throw new Error(`Duplicate PostgreSQL migration version: ${files[i].slice(0, files[i].indexOf('_'))}`);
     }
-    await tx.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)').run('001_initial', Date.now());
+  }
+  const migrations = await Promise.all(files.map(async name => {
+    const version = name.slice(0, -4), sql = await readFile(resolve(migrationsDir, name), 'utf8');
+    if (!sql.trim()) throw new Error(`PostgreSQL migration ${version} is empty`);
+    return { version, sql, checksum: createHash('sha256').update(sql).digest('hex') };
+  }));
+
+  await db.transaction(async tx => {
+    // Lock before creating the tracking table so simultaneous app startup is safe too.
+    await tx.prepare('SELECT pg_advisory_xact_lock(?)').get(1179466577);
+    await tx.exec('CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, applied_at BIGINT NOT NULL, checksum TEXT)');
+    await tx.exec('ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT');
+    for (const { version, sql, checksum } of migrations) {
+      const applied = await tx.prepare('SELECT checksum FROM schema_migrations WHERE version=?').get(version);
+      if (applied) {
+        if (applied.checksum && applied.checksum !== checksum) throw new Error(`Applied PostgreSQL migration has changed: ${version}`);
+        if (!applied.checksum) await tx.prepare('UPDATE schema_migrations SET checksum=? WHERE version=? AND checksum IS NULL').run(checksum, version);
+        continue;
+      }
+      await tx.exec(sql);
+      await tx.prepare('INSERT INTO schema_migrations(version,applied_at,checksum) VALUES(?,?,?)').run(version, Date.now(), checksum);
+    }
   });
 }

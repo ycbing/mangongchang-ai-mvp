@@ -45,6 +45,7 @@
 ### 5. PostgreSQL 部署基础
 - [x] 抽出 SQLite/PostgreSQL 异步数据库适配层；`DATABASE_URL` 选择 PostgreSQL，否则使用本地 SQLite。
 - [x] 建立版本化 PostgreSQL schema migration 与连接池配置。
+- [x] 启动时按序发现版本化迁移文件，使用 PostgreSQL advisory lock 保证多启动进程安全、幂等地应用迁移，并记录 SQL 校验和以发现已应用文件被修改。
 - [x] 增加 SQLite 到 PostgreSQL 的受保护导入脚本，校验全部目标表为空、逐张验证图片校验和并事务迁移表数据。
 - [x] 更新启动、配置和部署文档，提供 Docker Compose + PostgreSQL 单实例部署模板。
 - [x] 启用生产 Cookie Secure 标记，并对登录密码尝试增加独立限流。
