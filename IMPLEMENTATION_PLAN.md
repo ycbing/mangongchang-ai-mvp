@@ -41,3 +41,11 @@
 阶段 0–4 的本机闭环已完成，完成情况按实现核对。上线前仍需处理这些部署边界：PostgreSQL/S3/Redis 云端适配与多人协作不在本地单创作者目标内；JSON 备份不包含图片二进制，迁移时需同时复制 `data/assets/`；角色参考图尚未发送给不支持参考图的通用绘图端点；图片尺寸/解码的最终检查依赖浏览器。真实供应商调用需部署者提供凭证并验证。
 
 云端同步、多人协作和公开发布属于产品文档明确列出的 P2 / 明确不做范围；本轮先实现单机可运行的数据隔离基础和可选单用户鉴权。云端部署仍需部署环境、数据库/对象存储和供应商凭证。
+
+### 5. PostgreSQL 部署基础
+- [x] 抽出 SQLite/PostgreSQL 异步数据库适配层；`DATABASE_URL` 选择 PostgreSQL，否则使用本地 SQLite。
+- [x] 建立版本化 PostgreSQL schema migration 与连接池配置。
+- [x] 增加 SQLite 到 PostgreSQL 的受保护导入脚本，校验空目标库、事务迁移表数据并复制本地图片。
+- [x] 更新启动、配置和部署文档，提供 Docker Compose + PostgreSQL 单实例部署模板。
+- [ ] 在可访问 PostgreSQL 的环境执行真实迁移/导入验收；当前开发环境没有 PostgreSQL 服务。
+- [ ] 将图片本地目录替换为 S3 兼容存储，并将进程内 worker 替换为 Redis/BullMQ，完成多实例部署。

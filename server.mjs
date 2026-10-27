@@ -2,18 +2,28 @@ import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { openDatabase, applyPostgresMigrations } from './db-adapter.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 
 const root = resolve(fileURLToPath(new URL('.', import.meta.url)));
+// Read .env before evaluating configuration; shell-provided values always win.
+if (existsSync(join(root, '.env'))) {
+  const envText = await readFile(join(root, '.env'), 'utf8');
+  for (const line of envText.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (!match || match[1] in process.env) continue;
+    process.env[match[1]] = match[2].replace(/^(["'])(.*)\1$/, '$2');
+  }
+}
 const dataDir = join(root, 'data');
 const assetDir = resolve(process.env.LOCAL_STORAGE_DIR || join(dataDir, 'assets'));
 const dbFile = resolve(process.env.DATABASE_PATH || join(dataDir, 'mangongchang.sqlite'));
 const legacyFile = join(dataDir, 'state.json');
 const port = Number(process.env.PORT || 4173);
+const host = process.env.HOST || '127.0.0.1';
 const maxBodyBytes = Number(process.env.MAX_REQUEST_MB || 20) * 1_000_000;
 const maxImageBytes = Number(process.env.MAX_IMAGE_UPLOAD_MB || 10) * 1_000_000;
 const ownerId = 'local-owner';
@@ -25,15 +35,6 @@ const rateLimits = new Map();
 let runningImages = 0;
 let pumpScheduled = false;
 
-// Read an optional local .env without a package dependency. Existing shell env wins.
-if (existsSync(join(root, '.env'))) {
-  const envText = await readFile(join(root, '.env'), 'utf8');
-  for (const line of envText.split(/\r?\n/)) {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (!match || match[1] in process.env) continue;
-    process.env[match[1]] = match[2].replace(/^("|')(.*)\1$/, '$2');
-  }
-}
 const providerConfig = {
   llmProvider: process.env.LLM_PROVIDER || 'mock', llmBaseUrl: process.env.LLM_BASE_URL || '',
   llmApiKey: process.env.LLM_API_KEY || '', llmModel: process.env.LLM_MODEL || '',
@@ -42,9 +43,11 @@ const providerConfig = {
   imageSize: process.env.IMAGE_SIZE || '1024x1536',
 };
 await mkdir(assetDir, { recursive: true });
-await mkdir(dirname(dbFile), { recursive: true });
-const db = new DatabaseSync(dbFile);
-db.exec(`PRAGMA journal_mode=WAL;
+const db = await openDatabase({ databaseUrl: process.env.DATABASE_URL || '', databasePath: dbFile });
+if (db.kind === 'postgres') {
+  await applyPostgresMigrations(db, join(root, 'migrations'));
+} else {
+await db.exec(`PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, email TEXT UNIQUE, password_hash TEXT, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS app_state(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, snapshot TEXT NOT NULL, updated_at INTEGER NOT NULL);
@@ -62,12 +65,15 @@ CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, owner_id TEXT N
 CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, work_id TEXT, panel_id TEXT, kind TEXT NOT NULL, storage_key TEXT NOT NULL UNIQUE, mime_type TEXT NOT NULL, width INTEGER, height INTEGER, size_bytes INTEGER NOT NULL, checksum TEXT NOT NULL, metadata_json TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS assets_work_kind ON assets(owner_id,work_id,kind);
 CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, work_id TEXT NOT NULL, job_id TEXT NOT NULL, format TEXT NOT NULL, width INTEGER, height INTEGER, slice_count INTEGER NOT NULL DEFAULT 0, asset_ids_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, options_json TEXT NOT NULL, created_at INTEGER NOT NULL);`);
-const existingPanelIdKey=db.prepare('PRAGMA table_info(panels)').all().find(column=>column.name==='id');
-if(existingPanelIdKey?.pk===1){db.exec('DROP TABLE panels; CREATE TABLE panels(id TEXT NOT NULL, work_id TEXT NOT NULL, order_index INTEGER NOT NULL, storyboard_json TEXT NOT NULL, layout_json TEXT NOT NULL, current_image_asset_id TEXT, generation_status TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(work_id,id), UNIQUE(work_id,order_index));');}
+  const existingPanelColumns = await db.prepare('PRAGMA table_info(panels)').all();
+  const existingPanelIdKey = existingPanelColumns.find(column => column.name === 'id');
+  const existingPanelWorkKey = existingPanelColumns.find(column => column.name === 'work_id');
+  if (existingPanelIdKey?.pk === 1 && !existingPanelWorkKey?.pk) await db.exec('DROP TABLE panels; CREATE TABLE panels(id TEXT NOT NULL, work_id TEXT NOT NULL, order_index INTEGER NOT NULL, storyboard_json TEXT NOT NULL, layout_json TEXT NOT NULL, current_image_asset_id TEXT, generation_status TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(work_id,id), UNIQUE(work_id,order_index));');
+}
 function defaultState() {
   return { schemaVersion:1, characters:[{id:'char-xfc',name:'小废柴',summary:'认真又想准时下班的普通上班族',look:'圆脸、黑色短发和两撮翘起的呆毛；宽松浅黄色卫衣、深蓝长裤、白色运动鞋；胸前有绿色叶片徽章。',style:'清爽二维网络漫画，暖色平涂，深棕描边，柔和浅阴影。',archivedAt:null}], works:[], activeId:null };
 }
-let stateRow = db.prepare('SELECT revision,snapshot FROM app_state WHERE id=1').get();
+let stateRow = await db.prepare('SELECT revision,snapshot FROM app_state WHERE id=1').get();
 if (!stateRow) {
   let initial = defaultState();
   if (existsSync(legacyFile)) {
@@ -100,45 +106,57 @@ if (!stateRow) {
     (w.panels||[]).forEach((p,i)=>{ p.order ??= i; p.versions ??= [1]; p.version ??= 1; p.imageVersions ??= []; p.focalPoint ??= {x:.5,y:.5}; p.elements ??= []; });
   }
   const snapshot=JSON.stringify(initial), now=Date.now();
-  db.prepare('INSERT INTO app_state(id,revision,snapshot,updated_at) VALUES(1,1,?,?)').run(snapshot,now);
-  db.prepare('INSERT INTO state_history(revision,snapshot,created_at) VALUES(1,?,?)').run(snapshot,now);
+  await db.prepare('INSERT INTO app_state(id,revision,snapshot,updated_at) VALUES(1,1,?,?)').run(snapshot,now);
+  await db.prepare('INSERT INTO state_history(revision,snapshot,created_at) VALUES(1,?,?)').run(snapshot,now);
   stateRow={revision:1,snapshot};
 }
 let revision=Number(stateRow.revision);
 let state=JSON.parse(stateRow.snapshot);
-db.prepare('INSERT OR IGNORE INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?)').run(ownerId,null,null,Date.now());
-function syncProjection(snapshot){
-  db.prepare('DELETE FROM panels').run();db.prepare('DELETE FROM work_characters').run();db.prepare('DELETE FROM works WHERE owner_id=?').run(ownerId);db.prepare('DELETE FROM characters WHERE owner_id=?').run(ownerId);
-  const putChar=db.prepare('INSERT INTO characters(id,owner_id,name,summary,visual_profile_json,style_anchors_json,reference_asset_ids_json,tags_json,created_at,updated_at,archived_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
-  for(const c of snapshot.characters||[])putChar.run(c.id,ownerId,String(c.name||''),String(c.summary||''),JSON.stringify(c.visualProfile||{look:c.look||''}),JSON.stringify(c.styleAnchors||{style:c.style||''}),JSON.stringify(c.referenceAssetIds||[]),JSON.stringify(c.tags||[]),c.createdAt||c.updatedAt||Date.now(),c.updatedAt||Date.now(),c.archivedAt||null,c.deletedAt||null);
-  const putWork=db.prepare('INSERT INTO works(id,owner_id,title,premise,status,settings_json,character_snapshot_json,created_at,updated_at,archived_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)');
-  const putLink=db.prepare('INSERT INTO work_characters(work_id,character_id,snapshot_json) VALUES(?,?,?)');
-  const putPanel=db.prepare('INSERT INTO panels(id,work_id,order_index,storyboard_json,layout_json,current_image_asset_id,generation_status,updated_at) VALUES(?,?,?,?,?,?,?,?)');
-  for(const w of snapshot.works||[]){putWork.run(w.id,ownerId,String(w.title||''),String(w.premise||''),w.status||'editing',JSON.stringify(w.settings||{}),JSON.stringify(w.characterSnapshot||null),w.createdAt||w.updatedAt||Date.now(),w.updatedAt||Date.now(),w.archivedAt||null,w.deletedAt||null);if(w.characterId)putLink.run(w.id,w.characterId,JSON.stringify(w.characterSnapshot||{}));for(let i=0;i<(w.panels||[]).length;i++){const p=w.panels[i];const current=p.imageVersions?.find(v=>v.version===p.version);putPanel.run(p.id,w.id,i,JSON.stringify({scene:p.scene||'',action:p.action||'',camera:p.camera||'',expression:p.expression||'',dialogue:p.dialogue||'',caption:p.caption||'',sfx:p.sfx||'',imagePrompt:p.imagePrompt||'',negativePrompt:p.negativePrompt||'',tone:p.tone||''}),JSON.stringify({ratio:w.settings?.ratio||'4/5',fit:p.fit||'cover',focalPoint:p.focalPoint||{x:.5,y:.5},dialogueLayout:p.dialogueLayout||null,captionLayout:p.captionLayout||null,elements:p.elements||[]}),current?.assetId||null,p.generationStatus||'draft',w.updatedAt||Date.now());}}
+await db.prepare('INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING').run(ownerId,null,null,Date.now());
+async function syncProjection(snapshot, tx = db) {
+  await tx.prepare('DELETE FROM panels').run(); await tx.prepare('DELETE FROM work_characters').run();
+  await tx.prepare('DELETE FROM works WHERE owner_id=?').run(ownerId); await tx.prepare('DELETE FROM characters WHERE owner_id=?').run(ownerId);
+  const putChar=tx.prepare('INSERT INTO characters(id,owner_id,name,summary,visual_profile_json,style_anchors_json,reference_asset_ids_json,tags_json,created_at,updated_at,archived_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
+  for(const c of snapshot.characters||[]) await putChar.run(c.id,ownerId,String(c.name||''),String(c.summary||''),JSON.stringify(c.visualProfile||{look:c.look||''}),JSON.stringify(c.styleAnchors||{style:c.style||''}),JSON.stringify(c.referenceAssetIds||[]),JSON.stringify(c.tags||[]),c.createdAt||c.updatedAt||Date.now(),c.updatedAt||Date.now(),c.archivedAt||null,c.deletedAt||null);
+  const putWork=tx.prepare('INSERT INTO works(id,owner_id,title,premise,status,settings_json,character_snapshot_json,created_at,updated_at,archived_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)');
+  const putLink=tx.prepare('INSERT INTO work_characters(work_id,character_id,snapshot_json) VALUES(?,?,?)');
+  const putPanel=tx.prepare('INSERT INTO panels(id,work_id,order_index,storyboard_json,layout_json,current_image_asset_id,generation_status,updated_at) VALUES(?,?,?,?,?,?,?,?)');
+  for(const w of snapshot.works||[]) {
+    await putWork.run(w.id,ownerId,String(w.title||''),String(w.premise||''),w.status||'editing',JSON.stringify(w.settings||{}),JSON.stringify(w.characterSnapshot||null),w.createdAt||w.updatedAt||Date.now(),w.updatedAt||Date.now(),w.archivedAt||null,w.deletedAt||null);
+    if(w.characterId) await putLink.run(w.id,w.characterId,JSON.stringify(w.characterSnapshot||{}));
+    for(let i=0;i<(w.panels||[]).length;i++) { const p=w.panels[i], current=p.imageVersions?.find(v=>v.version===p.version); await putPanel.run(p.id,w.id,i,JSON.stringify({scene:p.scene||'',action:p.action||'',camera:p.camera||'',expression:p.expression||'',dialogue:p.dialogue||'',caption:p.caption||'',sfx:p.sfx||'',imagePrompt:p.imagePrompt||'',negativePrompt:p.negativePrompt||'',tone:p.tone||''}),JSON.stringify({ratio:w.settings?.ratio||'4/5',fit:p.fit||'cover',focalPoint:p.focalPoint||{x:.5,y:.5},dialogueLayout:p.dialogueLayout||null,captionLayout:p.captionLayout||null,elements:p.elements||[]}),current?.assetId||null,p.generationStatus||'draft',w.updatedAt||Date.now()); }
+  }
 }
-syncProjection(state);
-function saveState(next, expectedRevision) {
-  const actual=Number(db.prepare('SELECT revision FROM app_state WHERE id=1').get().revision);
-  if (expectedRevision !== undefined && Number(expectedRevision)!==actual) return {conflict:true,revision:actual,snapshot:JSON.parse(db.prepare('SELECT snapshot FROM app_state WHERE id=1').get().snapshot)};
-  const nextRevision=actual+1, now=Date.now(), json=JSON.stringify(next);
-  db.exec('BEGIN IMMEDIATE');
+await syncProjection(state);
+async function saveState(next, expectedRevision) {
+  let outcome;
   try {
-    db.prepare('UPDATE app_state SET revision=?,snapshot=?,updated_at=? WHERE id=1').run(nextRevision,json,now);
-    db.prepare('INSERT INTO state_history(revision,snapshot,created_at) VALUES(?,?,?)').run(nextRevision,json,now);
-    syncProjection(next);
-    db.prepare('DELETE FROM state_history WHERE revision NOT IN (SELECT revision FROM state_history ORDER BY revision DESC LIMIT 50)').run();
-    db.exec('COMMIT');
-    state=next; revision=nextRevision;
-    return {revision:nextRevision};
-  } catch (error) { db.exec('ROLLBACK'); throw error; }
+    await db.transaction(async tx => {
+      const current=await tx.prepare(`SELECT revision,snapshot FROM app_state WHERE id=1${db.kind==='postgres'?' FOR UPDATE':''}`).get();
+      const actual=Number(current.revision);
+      if (expectedRevision !== undefined && Number(expectedRevision)!==actual) { outcome={conflict:true,revision:actual,snapshot:JSON.parse(current.snapshot)}; return; }
+      const nextRevision=actual+1, now=Date.now(), json=JSON.stringify(next);
+      await tx.prepare('UPDATE app_state SET revision=?,snapshot=?,updated_at=? WHERE id=1').run(nextRevision,json,now);
+      await tx.prepare('INSERT INTO state_history(revision,snapshot,created_at) VALUES(?,?,?)').run(nextRevision,json,now);
+      await syncProjection(next, tx);
+      await tx.prepare('DELETE FROM state_history WHERE revision NOT IN (SELECT revision FROM state_history ORDER BY revision DESC LIMIT 50)').run();
+      outcome={revision:nextRevision};
+    });
+  } catch (error) {
+    try { const persisted=await db.prepare('SELECT revision,snapshot FROM app_state WHERE id=1').get(); if (persisted) { state=JSON.parse(persisted.snapshot); revision=Number(persisted.revision); } } catch { /* Preserve the original persistence error. */ }
+    throw error;
+  }
+  if (outcome?.revision) { state=next; revision=outcome.revision; }
+  if (outcome?.conflict) { state=outcome.snapshot; revision=outcome.revision; }
+  return outcome;
 }
 function rowToJob(row) {
   return {id:row.id,ownerId:row.owner_id,type:row.type,status:row.status,progress:row.progress,input:JSON.parse(row.input_json),result:row.result_json?JSON.parse(row.result_json):null,error:row.error_json?JSON.parse(row.error_json):null,idempotencyKey:row.idempotency_key,previousJobId:row.previous_job_id,attempts:row.attempts,createdAt:row.created_at,startedAt:row.started_at,finishedAt:row.finished_at};
 }
 const jobSelect=db.prepare('SELECT * FROM jobs WHERE id=? AND owner_id=?');
-function getJob(id){const row=jobSelect.get(id,ownerId);return row?rowToJob(row):null;}
+async function getJob(id){const row=await jobSelect.get(id,ownerId);return row?rowToJob(row):null;}
 const jobInsert=db.prepare('INSERT INTO jobs(id,owner_id,type,status,progress,input_json,idempotency_key,previous_job_id,attempts,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
-function saveJob(job){db.prepare(`UPDATE jobs SET status=?,progress=?,input_json=?,result_json=?,error_json=?,attempts=?,started_at=?,finished_at=? WHERE id=? AND owner_id=?`).run(job.status,job.progress,JSON.stringify(job.input),job.result?JSON.stringify(job.result):null,job.error?JSON.stringify(job.error):null,job.attempts||0,job.startedAt||null,job.finishedAt||null,job.id,ownerId);}
+async function saveJob(job){await db.prepare(`UPDATE jobs SET status=?,progress=?,input_json=?,result_json=?,error_json=?,attempts=?,started_at=?,finished_at=? WHERE id=? AND owner_id=?`).run(job.status,job.progress,JSON.stringify(job.input),job.result?JSON.stringify(job.result):null,job.error?JSON.stringify(job.error):null,job.attempts||0,job.startedAt||null,job.finishedAt||null,job.id,ownerId);}
 function configured(kind) {
   if (kind==='storyboard') return providerConfig.llmProvider!=='mock'&&providerConfig.llmBaseUrl&&providerConfig.llmApiKey&&providerConfig.llmModel;
   if (kind==='panel_image') return providerConfig.imageProvider!=='mock'&&providerConfig.imageBaseUrl&&providerConfig.imageApiKey&&providerConfig.imageModel;
@@ -163,7 +181,7 @@ async function callStoryboard(input,signal){
 }
 function imageExtension(contentType){const type=String(contentType).split(';')[0].trim().toLowerCase();if(type==='image/png')return ['.png',type];if(type==='image/jpeg'||type==='image/jpg')return ['.jpg','image/jpeg'];if(type==='image/webp')return ['.webp',type];throw new Error('图片格式不受支持（请使用 PNG、JPEG 或 WebP）');}
 function verifyImage(bytes,mime){const b=Buffer.from(bytes);const png=b.length>24&&b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));const jpeg=b.length>3&&b[0]===255&&b[1]===216&&b[2]===255;const webp=b.length>12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WEBP';if(!((mime==='image/png'&&png)||(mime==='image/jpeg'&&jpeg)||(mime==='image/webp'&&webp)))throw new Error('图片文件内容与类型不一致');if(png){const w=b.readUInt32BE(16),h=b.readUInt32BE(20);if(w>10000||h>10000||w*h>60_000_000)throw new Error('图片尺寸超出限制');return {width:w,height:h};}return {width:null,height:null};}
-async function saveImageAsset(bytes,contentType,metadata={}){if(bytes.byteLength>maxImageBytes*1.5)throw new Error('生成图片超过大小限制');const [suffix,mime]=imageExtension(contentType);const dimensions=verifyImage(bytes,mime);const name=`${randomUUID()}${suffix}`,id=randomUUID(),buffer=Buffer.from(bytes);await writeFile(join(assetDir,name),buffer,{flag:'wx'});db.prepare('INSERT INTO assets(id,owner_id,work_id,panel_id,kind,storage_key,mime_type,width,height,size_bytes,checksum,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,ownerId,metadata.workId||null,metadata.panelId||null,metadata.kind||'panel_image',name,mime,dimensions.width,dimensions.height,buffer.byteLength,createHash('sha256').update(buffer).digest('hex'),JSON.stringify(metadata),Date.now());return {assetId:id,imageUrl:`/assets/${name}`,mimeType:mime,sizeBytes:buffer.byteLength,...dimensions};}
+async function saveImageAsset(bytes,contentType,metadata={}){if(bytes.byteLength>maxImageBytes*1.5)throw new Error('生成图片超过大小限制');const [suffix,mime]=imageExtension(contentType);const dimensions=verifyImage(bytes,mime);const name=`${randomUUID()}${suffix}`,id=randomUUID(),buffer=Buffer.from(bytes);await writeFile(join(assetDir,name),buffer,{flag:'wx'});await db.prepare('INSERT INTO assets(id,owner_id,work_id,panel_id,kind,storage_key,mime_type,width,height,size_bytes,checksum,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,ownerId,metadata.workId||null,metadata.panelId||null,metadata.kind||'panel_image',name,mime,dimensions.width,dimensions.height,buffer.byteLength,createHash('sha256').update(buffer).digest('hex'),JSON.stringify(metadata),Date.now());return {assetId:id,imageUrl:`/assets/${name}`,mimeType:mime,sizeBytes:buffer.byteLength,...dimensions};}
 function privateAddress(address){if(isIP(address)===4){const a=address.split('.').map(Number);return a[0]===10||a[0]===127||a[0]===0||a[0]===169&&a[1]===254||a[0]===172&&a[1]>=16&&a[1]<=31||a[0]===192&&a[1]===168||a[0]>=224;}if(isIP(address)===6){const x=address.toLowerCase();return x==='::1'||x==='::'||x.startsWith('fc')||x.startsWith('fd')||x.startsWith('fe80')||x.startsWith('::ffff:127.');}return true;}
 async function safeImageFetch(value,signal){let url;try{url=new URL(value);}catch{throw new Error('绘图模型返回的图片地址无效');}for(let redirects=0;redirects<=4;redirects++){if(url.protocol!=='https:'||url.username||url.password)throw new Error('绘图模型图片地址必须使用 HTTPS');if(url.hostname==='localhost'||url.hostname.endsWith('.localhost'))throw new Error('绘图模型图片地址无效');const addresses=await lookup(url.hostname,{all:true}).catch(()=>[]);if(!addresses.length||addresses.some(x=>privateAddress(x.address)))throw new Error('绘图模型图片地址无法安全访问');const response=await fetch(url,{signal,redirect:'manual'});if(response.status>=300&&response.status<400){if(redirects===4)throw new Error('图片下载重定向次数过多');const location=response.headers.get('location');if(!location)throw new Error('图片地址重定向无效');url=new URL(location,url);continue;}return response;}throw new Error('图片下载失败');}
 async function callImageProvider(input,signal){
@@ -179,7 +197,7 @@ async function callImageProvider(input,signal){
 }
 function transientError(error){return error.name==='AbortError'||[429,500,502,503,504].includes(Number(error.status));}
 async function runJob(job){
-  job.status='running';job.startedAt=Date.now();job.progress=5;job.attempts=(job.attempts||0)+1;saveJob(job);jobsById.set(job.id,{...job,controller:null});const controller=new AbortController();jobsById.get(job.id).controller=controller;
+  job.status='running';job.startedAt=Date.now();job.progress=5;job.attempts=(job.attempts||0)+1;await saveJob(job);jobsById.set(job.id,{...job,controller:null});const controller=new AbortController();jobsById.get(job.id).controller=controller;
   const timeoutMs=job.type==='storyboard'?120000:180000;const timeout=setTimeout(()=>controller.abort(),timeoutMs);
   try {
     let result;
@@ -188,17 +206,17 @@ async function runJob(job){
       catch(error){if(attempt>=2||!transientError(error)||controller.signal.aborted)throw error;await new Promise((resolve,reject)=>{const t=setTimeout(resolve,500*2**attempt);controller.signal.addEventListener('abort',()=>{clearTimeout(t);reject(Object.assign(new Error('取消'),{name:'AbortError'}))},{once:true});});job.attempts++;}
     }
     if(job.status==='cancelled'||job.status==='cancel_requested')job.status='cancelled';else {job.status='succeeded';job.progress=100;job.result={...result,completedAt:Date.now()};}
-    job.finishedAt=Date.now();saveJob(job);
-    if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.versions=p.versions||[1];p.imageVersions=p.imageVersions||[];const v=p.versions.length?Math.max(...p.versions)+1:1;p.versions.push(v);p.version=v;if(job.result?.imageUrl)p.imageVersions.push({version:v,url:job.result.imageUrl,assetId:job.result.assetId,createdAt:Date.now()});p.generationStatus='succeeded';p.appliedJobId=job.id;w.updatedAt=Date.now();saveState(state);}}
-  } catch(error){if(job.status==='cancelled'||job.status==='cancel_requested')job.status='cancelled';else{job.status='failed';job.progress=0;job.error={code:error.name==='AbortError'?'PROVIDER_TIMEOUT':error.code||'PROVIDER_ERROR',message:error.name==='AbortError'?'模型任务已超时或取消':error.message||'任务失败',retryable:transientError(error)};}job.finishedAt=Date.now();saveJob(job);if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.generationStatus=job.status;p.lastJobError=job.error?.message||null;w.updatedAt=Date.now();saveState(state);}}}
+    job.finishedAt=Date.now();await saveJob(job);
+    if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.versions=p.versions||[1];p.imageVersions=p.imageVersions||[];const v=p.versions.length?Math.max(...p.versions)+1:1;p.versions.push(v);p.version=v;if(job.result?.imageUrl)p.imageVersions.push({version:v,url:job.result.imageUrl,assetId:job.result.assetId,createdAt:Date.now()});p.generationStatus='succeeded';p.appliedJobId=job.id;w.updatedAt=Date.now();await saveState(state);}}
+  } catch(error){if(job.status==='cancelled'||job.status==='cancel_requested')job.status='cancelled';else{job.status='failed';job.progress=0;job.error={code:error.name==='AbortError'?'PROVIDER_TIMEOUT':error.code||'PROVIDER_ERROR',message:error.name==='AbortError'?'模型任务已超时或取消':error.message||'任务失败',retryable:transientError(error)};}job.finishedAt=Date.now();await saveJob(job);if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.generationStatus=job.status;p.lastJobError=job.error?.message||null;w.updatedAt=Date.now();await saveState(state);}}}
   finally{clearTimeout(timeout);jobsById.delete(job.id);if(job.type==='panel_image')runningImages--;schedulePump();}
 }
-function schedulePump(){if(pumpScheduled)return;pumpScheduled=true;setImmediate(()=>{pumpScheduled=false;pumpQueue();});}
-function pumpQueue(){const rows=db.prepare("SELECT * FROM jobs WHERE owner_id=? AND status='queued' ORDER BY created_at LIMIT 20").all(ownerId);for(const row of rows){const job=rowToJob(row);if(job.type==='panel_image'&&runningImages>=2)continue;if(job.type==='panel_image')runningImages++;void runJob(job);}}
+function schedulePump(){if(pumpScheduled)return;pumpScheduled=true;setImmediate(()=>{pumpScheduled=false;void pumpQueue();});}
+async function pumpQueue(){const rows=await db.prepare("SELECT * FROM jobs WHERE owner_id=? AND status='queued' ORDER BY created_at LIMIT 20").all(ownerId);for(const row of rows){const job=rowToJob(row);if(job.type==='panel_image'&&runningImages>=2)continue;if(job.type==='panel_image')runningImages++;void runJob(job);}}
 // Expire works after the documented 30-day soft-delete recovery window.
-const expiry=Date.now()-30*86400_000,previousCount=state.works.length;state.works=state.works.filter(w=>!w.deletedAt||w.deletedAt>expiry);if(state.works.length!==previousCount)saveState(state);
+const expiry=Date.now()-30*86400_000,previousCount=state.works.length;state.works=state.works.filter(w=>!w.deletedAt||w.deletedAt>expiry);if(state.works.length!==previousCount)await saveState(state);
 // Recover unfinished work after process restarts. Inputs and job identity remain stable.
-db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status IN ('queued','running','cancel_requested')").run(ownerId);db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());
+await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status IN ('queued','running','cancel_requested')").run(ownerId);await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());
 schedulePump();
 function safeConfig(){return {llm:{provider:configured('storyboard')?'connected':'mock',model:configured('storyboard')?providerConfig.llmModel:null},image:{provider:configured('panel_image')?'connected':'mock',model:configured('panel_image')?providerConfig.imageModel:null}};}
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp'};
@@ -207,68 +225,69 @@ async function bodyJson(req){let raw='';for await(const chunk of req){raw+=chunk
 function rateLimit(req){const key=req.socket.remoteAddress||'local',now=Date.now(),old=rateLimits.get(key)||[];const recent=old.filter(t=>now-t<60000);if(recent.length>=300)return false;recent.push(now);rateLimits.set(key,recent);return true;}
 function assetView(row){return {id:row.id,url:`/assets/${row.storage_key}`,kind:row.kind,mimeType:row.mime_type,width:row.width,height:row.height,sizeBytes:row.size_bytes,createdAt:row.created_at};}
 function sessionToken(req){const value=String(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('mg_session='));return value?decodeURIComponent(value.slice('mg_session='.length)):'';}
-function isAuthenticated(req){if(!authEnabled)return true;const token=sessionToken(req);if(!token)return false;const hash=createHash('sha256').update(token).digest('hex');return !!db.prepare('SELECT 1 FROM sessions WHERE token_hash=? AND owner_id=? AND expires_at>?').get(hash,ownerId,Date.now());}
+async function isAuthenticated(req){if(!authEnabled)return true;const token=sessionToken(req);if(!token)return false;const hash=createHash('sha256').update(token).digest('hex');return !!(await db.prepare('SELECT 1 FROM sessions WHERE token_hash=? AND owner_id=? AND expires_at>?').get(hash,ownerId,Date.now()));}
 function sameOrigin(req){const origin=req.headers.origin;if(!origin)return true;try{return new URL(origin).host===req.headers.host;}catch{return false;}}
 const server=createServer(async(req,res)=>{
   const requestId=randomUUID();res.setHeader('x-request-id',requestId);
   try{
     if(!rateLimit(req))return send(res,429,{error:{code:'RATE_LIMITED',message:'请求过于频繁，请稍后再试'},requestId});
     const url=new URL(req.url||'/',`http://${req.headers.host||'localhost'}`),path=decodeURIComponent(url.pathname);
-    if(path==='/api/v1/auth/status'&&req.method==='GET')return send(res,200,{enabled:authEnabled,authenticated:isAuthenticated(req)});
+    if(path==='/api/v1/auth/status'&&req.method==='GET')return send(res,200,{enabled:authEnabled,authenticated:await isAuthenticated(req)});
     if(path==='/api/v1/auth/login'&&req.method==='POST'){
       if(!authEnabled)return send(res,400,{error:{code:'AUTH_DISABLED',message:'当前未启用账号鉴权'},requestId});if(!sameOrigin(req))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
       const input=await bodyJson(req),provided=String(input.password||''),a=createHash('sha256').update(provided).digest(),b=createHash('sha256').update(authPassword).digest();if(!timingSafeEqual(a,b))return send(res,401,{error:{code:'INVALID_CREDENTIALS',message:'密码不正确'},requestId});
-      const token=randomBytes(32).toString('base64url'),hash=createHash('sha256').update(token).digest('hex'),expires=Date.now()+sessionMs;db.prepare('INSERT INTO sessions(token_hash,owner_id,expires_at,created_at) VALUES(?,?,?,?)').run(hash,ownerId,expires,Date.now());return send(res,200,{authenticated:true,expiresAt:expires},{'set-cookie':`mg_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${req.socket.encrypted?'; Secure':''}`});
+      const token=randomBytes(32).toString('base64url'),hash=createHash('sha256').update(token).digest('hex'),expires=Date.now()+sessionMs;await db.prepare('INSERT INTO sessions(token_hash,owner_id,expires_at,created_at) VALUES(?,?,?,?)').run(hash,ownerId,expires,Date.now());return send(res,200,{authenticated:true,expiresAt:expires},{'set-cookie':`mg_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${req.socket.encrypted?'; Secure':''}`});
     }
-    if(path==='/api/v1/auth/logout'&&req.method==='POST'){const token=sessionToken(req);if(token)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(createHash('sha256').update(token).digest('hex'));return send(res,200,{loggedOut:true},{'set-cookie':'mg_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});}
-    if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!isAuthenticated(req))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
-    if(authEnabled&&path.startsWith('/assets/')&&!isAuthenticated(req))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
+    if(path==='/api/v1/auth/logout'&&req.method==='POST'){const token=sessionToken(req);if(token)await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(createHash('sha256').update(token).digest('hex'));return send(res,200,{loggedOut:true},{'set-cookie':'mg_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});}
+    if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
+    if(authEnabled&&path.startsWith('/assets/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&!sameOrigin(req)&&!['GET','HEAD','OPTIONS'].includes(req.method))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
-    if(req.method==='GET'&&path==='/api/v1/health')return send(res,200,{status:'ok',storage:'sqlite',queue:'memory-worker-with-sqlite-jobs',revision,...safeConfig()});
+    if(req.method==='GET'&&path==='/api/v1/health')return send(res,200,{status:'ok',storage:db.kind,queue:db.kind==='postgres'?'in-process-worker/postgres-jobs':'in-process-worker/sqlite-jobs',revision,...safeConfig()});
     if(req.method==='GET'&&path==='/api/v1/config')return send(res,200,safeConfig());
     if(path==='/api/v1/state'&&req.method==='GET')return send(res,200,{state,revision});
     if(path==='/api/v1/state'&&req.method==='PUT'){
       const next=await bodyJson(req);if(!next||!Array.isArray(next.works)||!Array.isArray(next.characters))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'作品或角色数据结构无效'},requestId});
-      const result=saveState(next,next.revision);if(result.conflict)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品数据已在其他窗口更新'},revision:result.revision,state:result.snapshot,requestId});return send(res,200,{saved:true,revision:result.revision,updatedAt:Date.now()});
+      const result=await saveState(next,next.revision);if(result.conflict)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品数据已在其他窗口更新'},revision:result.revision,state:result.snapshot,requestId});return send(res,200,{saved:true,revision:result.revision,updatedAt:Date.now()});
     }
     if(path==='/api/v1/works'&&req.method==='GET'){const q=(url.searchParams.get('q')||'').toLowerCase(),status=url.searchParams.get('status');return send(res,200,{items:state.works.filter(w=>!w.deletedAt&&(!q||`${w.title} ${w.premise}`.toLowerCase().includes(q))&&(!status||w.status===status)).sort((a,b)=>b.updatedAt-a.updatedAt)});}
     if(path==='/api/v1/characters'&&req.method==='GET'){const q=(url.searchParams.get('q')||'').toLowerCase();return send(res,200,{items:state.characters.filter(c=>!c.deletedAt&&(!q||`${c.name} ${c.summary} ${(c.tags||[]).join(' ')}`.toLowerCase().includes(q)))});}
     if(path==='/api/v1/assets/reference'&&req.method==='POST'){
-      const input=await bodyJson(req);const type=readText(input.mimeType,100),base64=readText(input.data,Math.ceil(maxImageBytes*4/3)+100);if(!base64||!['image/png','image/jpeg','image/webp'].includes(type))return send(res,422,{error:{code:'INVALID_IMAGE',message:'请选择 PNG、JPEG 或 WebP 图片'},requestId});const bytes=Buffer.from(base64.replace(/^data:[^,]+,/,'').replace(/^base64,/,'').replace(/\s/g,''),'base64');if(!bytes.length||bytes.length>maxImageBytes)return send(res,413,{error:{code:'IMAGE_SIZE_LIMIT',message:`图片大小不能超过 ${Math.floor(maxImageBytes/1e6)} MB`},requestId});const asset=await saveImageAsset(bytes,type,{kind:'character_ref'});const row=db.prepare('SELECT * FROM assets WHERE id=?').get(asset.assetId);return send(res,201,{asset:assetView(row)});
+      const input=await bodyJson(req);const type=readText(input.mimeType,100),base64=readText(input.data,Math.ceil(maxImageBytes*4/3)+100);if(!base64||!['image/png','image/jpeg','image/webp'].includes(type))return send(res,422,{error:{code:'INVALID_IMAGE',message:'请选择 PNG、JPEG 或 WebP 图片'},requestId});const bytes=Buffer.from(base64.replace(/^data:[^,]+,/,'').replace(/^base64,/,'').replace(/\s/g,''),'base64');if(!bytes.length||bytes.length>maxImageBytes)return send(res,413,{error:{code:'IMAGE_SIZE_LIMIT',message:`图片大小不能超过 ${Math.floor(maxImageBytes/1e6)} MB`},requestId});const asset=await saveImageAsset(bytes,type,{kind:'character_ref'});const row=await db.prepare('SELECT * FROM assets WHERE id=?').get(asset.assetId);return send(res,201,{asset:assetView(row)});
     }
-    if(path==='/api/v1/assets'&&req.method==='GET')return send(res,200,{items:db.prepare('SELECT * FROM assets WHERE owner_id=? ORDER BY created_at DESC LIMIT 200').all(ownerId).map(assetView)});
+    if(path==='/api/v1/assets'&&req.method==='GET')return send(res,200,{items:(await db.prepare('SELECT * FROM assets WHERE owner_id=? ORDER BY created_at DESC LIMIT 200').all(ownerId)).map(assetView)});
     if(path==='/api/v1/works'&&req.method==='POST'){
-      const input=await bodyJson(req);const title=readText(input.title,120);if(!title)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'作品标题不能为空'},requestId});const count=Math.max(1,Math.min(20,Number(input.panelCount)||8)),c=state.characters.find(x=>x.id===input.characterId);const panels=Array.from({length:count},(_,i)=>({id:randomUUID(),order:i,scene:'',action:'',camera:'',expression:'',dialogue:'',caption:'',sfx:'',imagePrompt:'',negativePrompt:'文字、水印、乱码',tone:'hope',versions:[1],version:1,imageVersions:[],focalPoint:{x:.5,y:.5},elements:[]}));const work={id:randomUUID(),schemaVersion:1,revision:1,title,premise:readText(input.premise,2000),characterId:c?.id||null,characterSnapshot:c?JSON.parse(JSON.stringify(c)):null,status:'editing',panels,settings:input.settings||{ratio:'4/5',gutter:16,bg:'#f6f4ed'},updatedAt:Date.now(),archivedAt:null,deletedAt:null};state.works.unshift(work);saveState(state);return send(res,201,{work,revision});
+      const input=await bodyJson(req);const title=readText(input.title,120);if(!title)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'作品标题不能为空'},requestId});const count=Math.max(1,Math.min(20,Number(input.panelCount)||8)),c=state.characters.find(x=>x.id===input.characterId);const panels=Array.from({length:count},(_,i)=>({id:randomUUID(),order:i,scene:'',action:'',camera:'',expression:'',dialogue:'',caption:'',sfx:'',imagePrompt:'',negativePrompt:'文字、水印、乱码',tone:'hope',versions:[1],version:1,imageVersions:[],focalPoint:{x:.5,y:.5},elements:[]}));const work={id:randomUUID(),schemaVersion:1,revision:1,title,premise:readText(input.premise,2000),characterId:c?.id||null,characterSnapshot:c?JSON.parse(JSON.stringify(c)):null,status:'editing',panels,settings:input.settings||{ratio:'4/5',gutter:16,bg:'#f6f4ed'},updatedAt:Date.now(),archivedAt:null,deletedAt:null};state.works.unshift(work);await saveState(state);return send(res,201,{work,revision});
     }
     const workRoute=path.match(/^\/api\/v1\/works\/([^/]+)(?:\/(storyboards|panels|image-jobs|exports|duplicate))?$/);
     if(workRoute){const [,workId,action]=workRoute,work=state.works.find(x=>x.id===workId&&!x.deletedAt);if(req.method==='GET'&&!action)return work?send(res,200,{work,revision}):send(res,404,{error:{code:'NOT_FOUND',message:'作品不存在'},requestId});if(!work)return send(res,404,{error:{code:'NOT_FOUND',message:'作品不存在'},requestId});
-      if(req.method==='PATCH'&&!action){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision,requestId});if(input.title!==undefined)work.title=readText(input.title,120);if(input.premise!==undefined)work.premise=readText(input.premise,2000);if(input.settings!==undefined)work.settings=input.settings;if(input.archivedAt!==undefined)work.archivedAt=input.archivedAt;if(input.status!==undefined)work.status=input.status;work.updatedAt=Date.now();const result=saveState(state,input.revision);return result.conflict?send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision:result.revision,requestId}):send(res,200,{work,revision});}
-      if(req.method==='DELETE'&&!action){work.deletedAt=Date.now();work.updatedAt=Date.now();saveState(state);return send(res,200,{deleted:true,undoUntil:Date.now()+30*86400_000,revision});}
-      if(req.method==='POST'&&action==='duplicate'){const input=await bodyJson(req),copy=JSON.parse(JSON.stringify(work));copy.id=randomUUID();copy.title=readText(input.title,120)||work.title+'（副本）';copy.status='editing';copy.updatedAt=Date.now();copy.deletedAt=null;copy.archivedAt=null;state.works.unshift(copy);saveState(state);return send(res,201,{work:copy,revision});}
-      if(req.method==='PATCH'&&action==='panels'){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision,requestId});if(!Array.isArray(input.panels)||input.panels.length>20)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'画格数据无效'},requestId});const seen=new Set();for(const panel of input.panels){if(!panel.id||seen.has(panel.id)||!work.panels.some(x=>x.id===panel.id))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'画格顺序包含无效 ID'},requestId});seen.add(panel.id);}work.panels=input.panels.map((p,i)=>({...p,order:i}));work.updatedAt=Date.now();const result=saveState(state,input.revision);return result.conflict?send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision:result.revision,requestId}):send(res,200,{saved:true,revision});}
-      if(req.method==='POST'&&['storyboards','image-jobs','exports'].includes(action)){const input=await bodyJson(req);const type=action==='storyboards'?'storyboard':action==='exports'?'export':input.type==='batch'?'batch_image':'panel_image';const jobInput={...input,workId:work.id,panelCount:input.panelCount||work.panels.length,premise:input.premise||work.premise,title:input.title||work.title};const id=randomUUID(),job={id,ownerId,type,status:'queued',progress:0,input:jobInput,createdAt:Date.now(),attempts:0};jobInsert.run(id,ownerId,type,'queued',0,JSON.stringify(jobInput),null,null,0,job.createdAt);schedulePump();return send(res,202,{jobId:id,status:'queued',pollUrl:`/api/v1/jobs/${id}`});}
+      if(req.method==='PATCH'&&!action){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision,requestId});if(input.title!==undefined)work.title=readText(input.title,120);if(input.premise!==undefined)work.premise=readText(input.premise,2000);if(input.settings!==undefined)work.settings=input.settings;if(input.archivedAt!==undefined)work.archivedAt=input.archivedAt;if(input.status!==undefined)work.status=input.status;work.updatedAt=Date.now();const result=await saveState(state,input.revision);return result.conflict?send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision:result.revision,requestId}):send(res,200,{work,revision});}
+      if(req.method==='DELETE'&&!action){work.deletedAt=Date.now();work.updatedAt=Date.now();await saveState(state);return send(res,200,{deleted:true,undoUntil:Date.now()+30*86400_000,revision});}
+      if(req.method==='POST'&&action==='duplicate'){const input=await bodyJson(req),copy=JSON.parse(JSON.stringify(work));copy.id=randomUUID();copy.title=readText(input.title,120)||work.title+'（副本）';copy.status='editing';copy.updatedAt=Date.now();copy.deletedAt=null;copy.archivedAt=null;state.works.unshift(copy);await saveState(state);return send(res,201,{work:copy,revision});}
+      if(req.method==='PATCH'&&action==='panels'){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision,requestId});if(!Array.isArray(input.panels)||input.panels.length>20)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'画格数据无效'},requestId});const seen=new Set();for(const panel of input.panels){if(!panel.id||seen.has(panel.id)||!work.panels.some(x=>x.id===panel.id))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'画格顺序包含无效 ID'},requestId});seen.add(panel.id);}work.panels=input.panels.map((p,i)=>({...p,order:i}));work.updatedAt=Date.now();const result=await saveState(state,input.revision);return result.conflict?send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision:result.revision,requestId}):send(res,200,{saved:true,revision});}
+      if(req.method==='POST'&&['storyboards','image-jobs','exports'].includes(action)){const input=await bodyJson(req);const type=action==='storyboards'?'storyboard':action==='exports'?'export':input.type==='batch'?'batch_image':'panel_image';const jobInput={...input,workId:work.id,panelCount:input.panelCount||work.panels.length,premise:input.premise||work.premise,title:input.title||work.title};const id=randomUUID(),job={id,ownerId,type,status:'queued',progress:0,input:jobInput,createdAt:Date.now(),attempts:0};await jobInsert.run(id,ownerId,type,'queued',0,JSON.stringify(jobInput),null,null,0,job.createdAt);schedulePump();return send(res,202,{jobId:id,status:'queued',pollUrl:`/api/v1/jobs/${id}`});}
     }
-    if(path==='/api/v1/characters'&&req.method==='POST'){const input=await bodyJson(req),name=readText(input.name,120);if(!name)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'角色名称不能为空'},requestId});const character={id:randomUUID(),...input,name,summary:readText(input.summary,500),look:readText(input.look||input.description,2000),style:readText(input.style,1000),tags:Array.isArray(input.tags)?input.tags.slice(0,30):[],referenceAssetIds:Array.isArray(input.referenceAssetIds)?input.referenceAssetIds.slice(0,10):[],createdAt:Date.now(),updatedAt:Date.now(),archivedAt:null,deletedAt:null};state.characters.push(character);saveState(state);return send(res,201,{character,revision});}
-    const charRoute=path.match(/^\/api\/v1\/characters\/([^/]+)$/);if(charRoute){const c=state.characters.find(x=>x.id===charRoute[1]&&!x.deletedAt);if(!c)return send(res,404,{error:{code:'NOT_FOUND',message:'角色不存在'},requestId});if(req.method==='GET')return send(res,200,{character:c});if(req.method==='PATCH'){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'角色已更新'},revision,requestId});for(const key of ['name','summary','look','style','tags','referenceAssetIds','archivedAt'])if(input[key]!==undefined)c[key]=input[key];c.updatedAt=Date.now();saveState(state,input.revision);return send(res,200,{character:c,revision});}if(req.method==='DELETE'){c.deletedAt=Date.now();c.updatedAt=Date.now();saveState(state);return send(res,200,{deleted:true,revision});}}
+    if(path==='/api/v1/characters'&&req.method==='POST'){const input=await bodyJson(req),name=readText(input.name,120);if(!name)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'角色名称不能为空'},requestId});const character={id:randomUUID(),...input,name,summary:readText(input.summary,500),look:readText(input.look||input.description,2000),style:readText(input.style,1000),tags:Array.isArray(input.tags)?input.tags.slice(0,30):[],referenceAssetIds:Array.isArray(input.referenceAssetIds)?input.referenceAssetIds.slice(0,10):[],createdAt:Date.now(),updatedAt:Date.now(),archivedAt:null,deletedAt:null};state.characters.push(character);await saveState(state);return send(res,201,{character,revision});}
+    const charRoute=path.match(/^\/api\/v1\/characters\/([^/]+)$/);if(charRoute){const c=state.characters.find(x=>x.id===charRoute[1]&&!x.deletedAt);if(!c)return send(res,404,{error:{code:'NOT_FOUND',message:'角色不存在'},requestId});if(req.method==='GET')return send(res,200,{character:c});if(req.method==='PATCH'){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'角色已更新'},revision,requestId});for(const key of ['name','summary','look','style','tags','referenceAssetIds','archivedAt'])if(input[key]!==undefined)c[key]=input[key];c.updatedAt=Date.now();await saveState(state,input.revision);return send(res,200,{character:c,revision});}if(req.method==='DELETE'){c.deletedAt=Date.now();c.updatedAt=Date.now();await saveState(state);return send(res,200,{deleted:true,revision});}}
     if(path==='/api/v1/jobs'&&req.method==='POST'){
       const payload=await bodyJson(req);if(!['storyboard','panel_image','export','batch_image'].includes(payload.type))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'不支持的任务类型'},requestId});
       const input=payload.input||{};if(!input||typeof input!=='object'||Array.isArray(input))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'任务参数无效'},requestId});
-      const idem=readText(req.headers['idempotency-key'],160)||readText(payload.idempotencyKey,160);if(idem){const found=db.prepare('SELECT * FROM jobs WHERE owner_id=? AND idempotency_key=?').get(ownerId,idem);if(found)return send(res,200,rowToJob(found));}
-      const active=Number(db.prepare("SELECT count(*) n FROM jobs WHERE owner_id=? AND status IN ('queued','running','cancel_requested')").get(ownerId).n);if(active>=20)return send(res,429,{error:{code:'QUEUE_LIMIT',message:'当前待处理任务已达 20 个，请等待部分任务完成'},requestId});
-      if(payload.type==='batch_image'){const ids=Array.isArray(input.panelIds)?input.panelIds.slice(0,20):[];if(!ids.length)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'请至少选择一个画格'},requestId});const created=[];for(const panelId of ids){const id=randomUUID(),job={id,type:'panel_image',status:'queued',progress:0,input:{...input,panelId,prompt:readText(input.prompts?.[panelId]||input.prompt,5000)},createdAt:Date.now(),attempts:0};jobInsert.run(id,ownerId,job.type,job.status,0,JSON.stringify(job.input),null,null,0,job.createdAt);created.push(job);}schedulePump();return send(res,202,{batchId:randomUUID(),items:created});}
-      const id=randomUUID(),job={id,ownerId,type:payload.type,status:'queued',progress:0,input,createdAt:Date.now(),attempts:0,idempotencyKey:idem||null,previousJobId:null};jobInsert.run(id,ownerId,job.type,job.status,0,JSON.stringify(input),idem||null,null,0,job.createdAt);schedulePump();return send(res,202,job);
+      const idem=readText(req.headers['idempotency-key'],160)||readText(payload.idempotencyKey,160);if(idem){const found=await db.prepare('SELECT * FROM jobs WHERE owner_id=? AND idempotency_key=?').get(ownerId,idem);if(found)return send(res,200,rowToJob(found));}
+      const active=Number((await db.prepare("SELECT count(*) n FROM jobs WHERE owner_id=? AND status IN ('queued','running','cancel_requested')").get(ownerId)).n);if(active>=20)return send(res,429,{error:{code:'QUEUE_LIMIT',message:'当前待处理任务已达 20 个，请等待部分任务完成'},requestId});
+      if(payload.type==='batch_image'){const ids=Array.isArray(input.panelIds)?input.panelIds.slice(0,20):[];if(!ids.length)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'请至少选择一个画格'},requestId});const created=[];for(const panelId of ids){const id=randomUUID(),job={id,type:'panel_image',status:'queued',progress:0,input:{...input,panelId,prompt:readText(input.prompts?.[panelId]||input.prompt,5000)},createdAt:Date.now(),attempts:0};await jobInsert.run(id,ownerId,job.type,job.status,0,JSON.stringify(job.input),null,null,0,job.createdAt);created.push(job);}schedulePump();return send(res,202,{batchId:randomUUID(),items:created});}
+      const id=randomUUID(),job={id,ownerId,type:payload.type,status:'queued',progress:0,input,createdAt:Date.now(),attempts:0,idempotencyKey:idem||null,previousJobId:null};await jobInsert.run(id,ownerId,job.type,job.status,0,JSON.stringify(input),idem||null,null,0,job.createdAt);schedulePump();return send(res,202,job);
     }
     const retryMatch=path.match(/^\/api\/v1\/jobs\/([^/]+)\/retry$/);
-    if(retryMatch&&req.method==='POST'){const prev=getJob(retryMatch[1]);if(!prev)return send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});if(prev.status!=='failed'&&prev.status!=='cancelled')return send(res,409,{error:{code:'JOB_NOT_RETRYABLE',message:'只有失败或取消的任务可以重试'},requestId});const id=randomUUID(),job={...prev,id,status:'queued',progress:0,result:null,error:null,attempts:0,createdAt:Date.now(),startedAt:null,finishedAt:null,previousJobId:prev.id,idempotencyKey:null};jobInsert.run(id,ownerId,job.type,job.status,0,JSON.stringify(job.input),null,prev.id,0,job.createdAt);schedulePump();return send(res,202,job);}
+    if(retryMatch&&req.method==='POST'){const prev=await getJob(retryMatch[1]);if(!prev)return send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});if(prev.status!=='failed'&&prev.status!=='cancelled')return send(res,409,{error:{code:'JOB_NOT_RETRYABLE',message:'只有失败或取消的任务可以重试'},requestId});const id=randomUUID(),job={...prev,id,status:'queued',progress:0,result:null,error:null,attempts:0,createdAt:Date.now(),startedAt:null,finishedAt:null,previousJobId:prev.id,idempotencyKey:null};await jobInsert.run(id,ownerId,job.type,job.status,0,JSON.stringify(job.input),null,prev.id,0,job.createdAt);schedulePump();return send(res,202,job);}
     const cancelMatch=path.match(/^\/api\/v1\/jobs\/([^/]+)\/cancel$/);
-    if(cancelMatch&&req.method==='POST'){const job=getJob(cancelMatch[1]);if(!job)return send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});if(job.status==='queued'){job.status='cancelled';job.finishedAt=Date.now();saveJob(job);}else if(job.status==='running'){job.status='cancel_requested';saveJob(job);jobsById.get(job.id)?.controller?.abort();}return send(res,200,job);}
-    if(path==='/api/v1/jobs'&&req.method==='GET'){const rows=db.prepare('SELECT * FROM jobs WHERE owner_id=? ORDER BY created_at DESC LIMIT 100').all(ownerId);const workId=url.searchParams.get('workId');return send(res,200,{items:rows.map(rowToJob).filter(j=>!workId||j.input.workId===workId)});}
+    if(cancelMatch&&req.method==='POST'){const job=await getJob(cancelMatch[1]);if(!job)return send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});if(job.status==='queued'){job.status='cancelled';job.finishedAt=Date.now();await saveJob(job);}else if(job.status==='running'){job.status='cancel_requested';await saveJob(job);jobsById.get(job.id)?.controller?.abort();}return send(res,200,job);}
+    if(path==='/api/v1/jobs'&&req.method==='GET'){const rows=await db.prepare('SELECT * FROM jobs WHERE owner_id=? ORDER BY created_at DESC LIMIT 100').all(ownerId);const workId=url.searchParams.get('workId');return send(res,200,{items:rows.map(rowToJob).filter(j=>!workId||j.input.workId===workId)});}
     const jobMatch=path.match(/^\/api\/v1\/jobs\/([^/]+)$/);
-    if(jobMatch&&req.method==='GET'){const job=getJob(jobMatch[1]);return job?send(res,200,job):send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});}
+    if(jobMatch&&req.method==='GET'){const job=await getJob(jobMatch[1]);return job?send(res,200,job):send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});}
     const assetMatch=path.match(/^\/assets\/([0-9a-f-]+\.(?:png|jpg|webp))$/i);
     if(req.method==='GET'&&assetMatch){try{const data=await readFile(join(assetDir,assetMatch[1]));return res.writeHead(200,{'content-type':mime[extname(assetMatch[1])],'cache-control':'private, max-age=86400','x-content-type-options':'nosniff'}).end(data);}catch{return send(res,404,{error:{code:'NOT_FOUND',message:'图片资源不存在'},requestId});}}
     if(req.method==='GET'&&!path.startsWith('/api/')){const requested=path==='/'?'index.html':path.slice(1),file=resolve(root,normalize(requested));if(file!==root&&!file.startsWith(root+sep))return send(res,403,{error:{code:'FORBIDDEN',message:'禁止访问'},requestId});try{const data=await readFile(file);res.writeHead(200,{'content-type':mime[extname(file)]||'application/octet-stream','x-content-type-options':'nosniff','content-security-policy':"default-src 'self' data: blob:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'"});return res.end(data);}catch{return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});}}
     return send(res,404,{error:{code:'NOT_FOUND',message:'接口不存在'},requestId});
   }catch(error){const status=error.status||500;console.error(JSON.stringify({requestId,code:error.code||'INTERNAL_ERROR',status}));return send(res,status,{error:{code:status===413?'PAYLOAD_TOO_LARGE':status===400?'BAD_JSON':error.code||'INTERNAL_ERROR',message:status>=500?'服务暂时不可用':error.message||'请求无效'},requestId});}
 });
-server.listen(port,'127.0.0.1',()=>console.log(`漫工厂 AI 已启动：http://localhost:${port}`));
+server.listen(port,host,()=>console.log(`漫工厂 AI 已启动：http://${host}:${port}`));
+for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ server.close(async()=>{ await db.close(); process.exit(0); }); setTimeout(()=>process.exit(1),10_000).unref(); });

@@ -1,0 +1,16 @@
+CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, email TEXT UNIQUE, password_hash TEXT, created_at BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS app_state(id INTEGER PRIMARY KEY CHECK(id=1), revision BIGINT NOT NULL, snapshot TEXT NOT NULL, updated_at BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS characters(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL, summary TEXT NOT NULL, visual_profile_json TEXT NOT NULL, style_anchors_json TEXT NOT NULL, reference_asset_ids_json TEXT NOT NULL, tags_json TEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, archived_at BIGINT, deleted_at BIGINT);
+CREATE INDEX IF NOT EXISTS characters_owner_archived_updated ON characters(owner_id,archived_at,updated_at DESC);
+CREATE TABLE IF NOT EXISTS works(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, title TEXT NOT NULL, premise TEXT NOT NULL, status TEXT NOT NULL, settings_json TEXT NOT NULL, character_snapshot_json TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, archived_at BIGINT, deleted_at BIGINT);
+CREATE INDEX IF NOT EXISTS works_owner_archived_updated ON works(owner_id,archived_at,updated_at DESC);
+CREATE TABLE IF NOT EXISTS work_characters(work_id TEXT NOT NULL, character_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, PRIMARY KEY(work_id,character_id));
+CREATE TABLE IF NOT EXISTS panels(id TEXT NOT NULL, work_id TEXT NOT NULL, order_index INTEGER NOT NULL, storyboard_json TEXT NOT NULL, layout_json TEXT NOT NULL, current_image_asset_id TEXT, generation_status TEXT, updated_at BIGINT NOT NULL, PRIMARY KEY(work_id,id), UNIQUE(work_id,order_index));
+CREATE TABLE IF NOT EXISTS state_history(revision BIGINT PRIMARY KEY, snapshot TEXT NOT NULL, created_at BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL, input_json TEXT NOT NULL, result_json TEXT, error_json TEXT, idempotency_key TEXT, previous_job_id TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, started_at BIGINT, finished_at BIGINT);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_owner_idempotency ON jobs(owner_id,idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_owner_status_created ON jobs(owner_id,status,created_at);
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, owner_id TEXT NOT NULL, expires_at BIGINT NOT NULL, created_at BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, work_id TEXT, panel_id TEXT, kind TEXT NOT NULL, storage_key TEXT NOT NULL UNIQUE, mime_type TEXT NOT NULL, width INTEGER, height INTEGER, size_bytes BIGINT NOT NULL, checksum TEXT NOT NULL, metadata_json TEXT NOT NULL, created_at BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS assets_work_kind ON assets(owner_id,work_id,kind);
+CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, work_id TEXT NOT NULL, job_id TEXT NOT NULL, format TEXT NOT NULL, width INTEGER, height INTEGER, slice_count INTEGER NOT NULL DEFAULT 0, asset_ids_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, options_json TEXT NOT NULL, created_at BIGINT NOT NULL);
