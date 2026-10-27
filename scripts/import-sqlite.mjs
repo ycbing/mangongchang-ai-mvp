@@ -1,9 +1,11 @@
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { copyFile, mkdir, readdir, stat } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { root } from './env.mjs';
 import { openDatabase, applyPostgresMigrations } from '../db-adapter.mjs';
+
 if (!process.env.DATABASE_URL) throw new Error('请先在 .env 中设置 DATABASE_URL');
 const sourcePath = resolve(process.env.SOURCE_DATABASE_PATH || join(root, 'data', 'mangongchang.sqlite'));
 const sourceAssets = resolve(process.env.SOURCE_ASSET_DIR || join(dirname(sourcePath), 'assets'));
@@ -26,19 +28,34 @@ const tables = {
 };
 try {
   await applyPostgresMigrations(pg, join(root, 'migrations'));
-  const occupied = await pg.prepare('SELECT (SELECT count(*) FROM app_state) AS state_count, (SELECT count(*) FROM assets) AS asset_count, (SELECT count(*) FROM jobs) AS job_count').get();
-  if (Number(occupied.state_count) || Number(occupied.asset_count) || Number(occupied.job_count)) throw new Error('目标 PostgreSQL 已有作品、资源或任务数据。为避免覆盖，请使用一个空数据库导入。');
+  const occupancySql = Object.keys(tables).map(table => `(SELECT count(*) FROM ${table}) AS ${table}_count`).join(', ');
+  const occupied = await pg.prepare(`SELECT ${occupancySql}`).get();
+  if (Object.values(occupied).some(value => Number(value) > 0)) throw new Error('目标 PostgreSQL 已有数据。为避免覆盖，请使用一个全新空数据库。');
   const state = sqlite.prepare('SELECT count(*) AS count FROM app_state').get();
   if (!state.count) throw new Error('SQLite 数据库中没有 app_state 数据。');
-  if (existsSync(sourceAssets)) {
-    await mkdir(targetAssets, { recursive: true });
-    for (const entry of await readdir(sourceAssets, { withFileTypes: true })) {
-      if (!entry.isFile()) continue;
-      const from = join(sourceAssets, entry.name), to = join(targetAssets, entry.name);
-      if (existsSync(to)) { const a = await stat(from), b = await stat(to); if (a.size !== b.size) throw new Error(`目标图片已存在且大小不同：${entry.name}`); }
-      else await copyFile(from, to);
-    }
+
+  // Preflight every referenced file before inserting any metadata into PostgreSQL.
+  const sourceAssetRows = sqlite.prepare('SELECT storage_key,checksum FROM assets').all();
+  if (sourceAssetRows.length && !existsSync(sourceAssets)) throw new Error(`SQLite 资源目录不存在：${sourceAssets}`);
+  const filesToCopy = [];
+  for (const asset of sourceAssetRows) {
+    const key = String(asset.storage_key || '');
+    if (!key || key !== key.split(/[\\/]/).at(-1) || key.startsWith('.')) throw new Error(`资源记录包含无效存储路径：${key}`);
+    const from = join(sourceAssets, key);
+    const sourceInfo = await lstat(from);
+    if (!sourceInfo.isFile()) throw new Error(`资源不是普通文件：${key}`);
+    const sourceBytes = await readFile(from);
+    const checksum = createHash('sha256').update(sourceBytes).digest('hex');
+    if (checksum !== asset.checksum) throw new Error(`源图片校验失败：${key}`);
+    const to = join(targetAssets, key);
+    if (existsSync(to)) {
+      const targetBytes = await readFile(to);
+      if (createHash('sha256').update(targetBytes).digest('hex') !== checksum) throw new Error(`目标图片已存在且校验和不同：${key}`);
+    } else filesToCopy.push({ from, to });
   }
+  if (filesToCopy.length) await mkdir(targetAssets, { recursive: true });
+  for (const file of filesToCopy) await copyFile(file.from, file.to);
+
   await pg.transaction(async tx => {
     for (const [table, columns] of Object.entries(tables)) {
       const rows = sqlite.prepare(`SELECT ${columns.join(',')} FROM ${table}`).all();
@@ -47,4 +64,7 @@ try {
     }
   });
   console.log(`SQLite 数据已导入 PostgreSQL；图片已复制到 ${targetAssets}`);
-} finally { sqlite.close(); await pg.close(); }
+} finally {
+  sqlite.close();
+  await pg.close();
+}

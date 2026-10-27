@@ -32,6 +32,7 @@ const authEnabled = authPassword.length > 0;
 const sessionMs = Math.max(1, Math.min(30, Number(process.env.AUTH_SESSION_DAYS)||7))*86400_000;
 const jobsById = new Map();
 const rateLimits = new Map();
+const loginAttempts = new Map();
 let runningImages = 0;
 let pumpScheduled = false;
 
@@ -151,7 +152,7 @@ async function saveState(next, expectedRevision) {
   return outcome;
 }
 function rowToJob(row) {
-  return {id:row.id,ownerId:row.owner_id,type:row.type,status:row.status,progress:row.progress,input:JSON.parse(row.input_json),result:row.result_json?JSON.parse(row.result_json):null,error:row.error_json?JSON.parse(row.error_json):null,idempotencyKey:row.idempotency_key,previousJobId:row.previous_job_id,attempts:row.attempts,createdAt:row.created_at,startedAt:row.started_at,finishedAt:row.finished_at};
+  return {id:row.id,ownerId:row.owner_id,type:row.type,status:row.status,progress:row.progress,input:JSON.parse(row.input_json),result:row.result_json?JSON.parse(row.result_json):null,error:row.error_json?JSON.parse(row.error_json):null,idempotencyKey:row.idempotency_key,previousJobId:row.previous_job_id,attempts:Number(row.attempts),createdAt:Number(row.created_at),startedAt:row.started_at===null?null:Number(row.started_at),finishedAt:row.finished_at===null?null:Number(row.finished_at)};
 }
 const jobSelect=db.prepare('SELECT * FROM jobs WHERE id=? AND owner_id=?');
 async function getJob(id){const row=await jobSelect.get(id,ownerId);return row?rowToJob(row):null;}
@@ -222,8 +223,9 @@ function safeConfig(){return {llm:{provider:configured('storyboard')?'connected'
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp'};
 function send(res,code,body,headers={}){res.writeHead(code,{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...headers});res.end(JSON.stringify(body));}
 async function bodyJson(req){let raw='';for await(const chunk of req){raw+=chunk;if(Buffer.byteLength(raw)>maxBodyBytes)throw Object.assign(new Error('请求内容过大'),{status:413});}try{return raw?JSON.parse(raw):{};}catch{throw Object.assign(new Error('JSON 格式无效'),{status:400});}}
-function rateLimit(req){const key=req.socket.remoteAddress||'local',now=Date.now(),old=rateLimits.get(key)||[];const recent=old.filter(t=>now-t<60000);if(recent.length>=300)return false;recent.push(now);rateLimits.set(key,recent);return true;}
-function assetView(row){return {id:row.id,url:`/assets/${row.storage_key}`,kind:row.kind,mimeType:row.mime_type,width:row.width,height:row.height,sizeBytes:row.size_bytes,createdAt:row.created_at};}
+function rateLimit(req){const key=req.socket.remoteAddress||'local',now=Date.now(),old=rateLimits.get(key)||[];const recent=old.filter(t=>now-t<60000);if(recent.length>=300)return false;recent.push(now);rateLimits.set(key,recent);if(rateLimits.size>5000)rateLimits.delete(rateLimits.keys().next().value);return true;}
+function allowLoginAttempt(req){const key=req.socket.remoteAddress||'local',now=Date.now(),recent=(loginAttempts.get(key)||[]).filter(t=>now-t<900000);if(recent.length>=10){loginAttempts.set(key,recent);return false;}recent.push(now);loginAttempts.set(key,recent);if(loginAttempts.size>5000)loginAttempts.delete(loginAttempts.keys().next().value);return true;}
+function assetView(row){return {id:row.id,url:`/assets/${row.storage_key}`,kind:row.kind,mimeType:row.mime_type,width:row.width,height:row.height,sizeBytes:Number(row.size_bytes),createdAt:Number(row.created_at)};}
 function sessionToken(req){const value=String(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('mg_session='));return value?decodeURIComponent(value.slice('mg_session='.length)):'';}
 async function isAuthenticated(req){if(!authEnabled)return true;const token=sessionToken(req);if(!token)return false;const hash=createHash('sha256').update(token).digest('hex');return !!(await db.prepare('SELECT 1 FROM sessions WHERE token_hash=? AND owner_id=? AND expires_at>?').get(hash,ownerId,Date.now()));}
 function sameOrigin(req){const origin=req.headers.origin;if(!origin)return true;try{return new URL(origin).host===req.headers.host;}catch{return false;}}
@@ -234,11 +236,11 @@ const server=createServer(async(req,res)=>{
     const url=new URL(req.url||'/',`http://${req.headers.host||'localhost'}`),path=decodeURIComponent(url.pathname);
     if(path==='/api/v1/auth/status'&&req.method==='GET')return send(res,200,{enabled:authEnabled,authenticated:await isAuthenticated(req)});
     if(path==='/api/v1/auth/login'&&req.method==='POST'){
-      if(!authEnabled)return send(res,400,{error:{code:'AUTH_DISABLED',message:'当前未启用账号鉴权'},requestId});if(!sameOrigin(req))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
-      const input=await bodyJson(req),provided=String(input.password||''),a=createHash('sha256').update(provided).digest(),b=createHash('sha256').update(authPassword).digest();if(!timingSafeEqual(a,b))return send(res,401,{error:{code:'INVALID_CREDENTIALS',message:'密码不正确'},requestId});
-      const token=randomBytes(32).toString('base64url'),hash=createHash('sha256').update(token).digest('hex'),expires=Date.now()+sessionMs;await db.prepare('INSERT INTO sessions(token_hash,owner_id,expires_at,created_at) VALUES(?,?,?,?)').run(hash,ownerId,expires,Date.now());return send(res,200,{authenticated:true,expiresAt:expires},{'set-cookie':`mg_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${req.socket.encrypted?'; Secure':''}`});
+      if(!authEnabled)return send(res,400,{error:{code:'AUTH_DISABLED',message:'当前未启用账号鉴权'},requestId});if(!sameOrigin(req))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});if(!allowLoginAttempt(req))return send(res,429,{error:{code:'LOGIN_RATE_LIMITED',message:'尝试次数过多，请 15 分钟后再试'},requestId},{'retry-after':'900'});
+      const input=await bodyJson(req),provided=String(input.password||''),a=createHash('sha256').update(provided).digest(),b=createHash('sha256').update(authPassword).digest();if(!timingSafeEqual(a,b))return send(res,401,{error:{code:'INVALID_CREDENTIALS',message:'密码不正确'},requestId});loginAttempts.delete(req.socket.remoteAddress||'local');
+      const token=randomBytes(32).toString('base64url'),hash=createHash('sha256').update(token).digest('hex'),expires=Date.now()+sessionMs;await db.prepare('INSERT INTO sessions(token_hash,owner_id,expires_at,created_at) VALUES(?,?,?,?)').run(hash,ownerId,expires,Date.now());return send(res,200,{authenticated:true,expiresAt:expires},{'set-cookie':`mg_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${req.socket.encrypted||process.env.NODE_ENV==='production'?'; Secure':''}`});
     }
-    if(path==='/api/v1/auth/logout'&&req.method==='POST'){const token=sessionToken(req);if(token)await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(createHash('sha256').update(token).digest('hex'));return send(res,200,{loggedOut:true},{'set-cookie':'mg_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});}
+    if(path==='/api/v1/auth/logout'&&req.method==='POST'){const token=sessionToken(req);if(token)await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(createHash('sha256').update(token).digest('hex'));return send(res,200,{loggedOut:true},{'set-cookie':`mg_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${req.socket.encrypted||process.env.NODE_ENV==='production'?'; Secure':''}`});}
     if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&path.startsWith('/assets/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&!sameOrigin(req)&&!['GET','HEAD','OPTIONS'].includes(req.method))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
