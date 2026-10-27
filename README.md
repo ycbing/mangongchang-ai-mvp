@@ -23,7 +23,7 @@ AUTH_PASSWORD=替换为高强度随机密码
 LOCAL_STORAGE_DIR=/持久化磁盘/mangongchang-assets
 ```
 
-`DATABASE_URL` 非空时应用启动前会检查 PostgreSQL 连接并应用版本化迁移（`migrations/`）。连接池默认为 10，可用 `PG_POOL_MAX` 调整。容器部署可设置 `HOST=0.0.0.0` 并放在 HTTPS 反向代理后；本机默认仅监听回环地址。没有 `DATABASE_URL` 时继续使用 SQLite。
+`DATABASE_URL` 非空时应用启动前会检查 PostgreSQL 连接并应用版本化迁移（`migrations/`）。连接池默认为 10，可用 `PG_POOL_MAX` 调整。容器部署可设置 `HOST=0.0.0.0` 并放在 HTTPS 反向代理后；本机默认仅监听回环地址。没有 `DATABASE_URL` 时继续使用 SQLite。若设置 `REDIS_URL`，任务会通过 BullMQ 投递到 Redis；数据库中的任务记录是恢复与轮询依据，应用会定时重新投递仍处于排队状态的任务。
 
 将现有 SQLite 数据导入一个已创建、尚无作品数据的 PostgreSQL 数据库：
 
@@ -64,14 +64,19 @@ npm run db:import-sqlite
 
 ## Docker Compose 部署
 
-复制 `.env.example` 为 `.env`，然后为 `POSTGRES_PASSWORD` 和 `AUTH_PASSWORD` 分别设置高强度随机值（数据库密码建议使用字母数字，确保连接串安全）。启动命令：
+复制 `.env.example` 为 `.env`，然后为 `POSTGRES_PASSWORD`、`REDIS_PASSWORD` 和 `AUTH_PASSWORD` 分别设置高强度随机值（数据库和 Redis 密码建议使用字母数字，确保连接串安全）。启动命令：
 
 ```sh
 docker compose up --build -d
 ```
 
-Compose 会先等待 PostgreSQL 健康，再启动应用并自动执行数据库迁移；数据库和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；应用启动会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
+Compose 会先等待 PostgreSQL 和 Redis 健康，再启动应用并自动执行数据库迁移；PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；应用启动会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
 
 ### S3 兼容图片存储
 
 设置 `S3_BUCKET` 可将角色参考图和生成图片写入 S3；留空时应用继续使用 `LOCAL_STORAGE_DIR`。可配置 `S3_ENDPOINT`（MinIO 等兼容服务）、`S3_REGION`、`S3_ACCESS_KEY_ID`、`S3_SECRET_ACCESS_KEY` 和 `S3_FORCE_PATH_STYLE`。若运行环境支持 IAM/默认凭证链，可省略访问密钥；提供自定义端点时，非本机地址必须使用 HTTPS。应用启动会检查 bucket 访问权限，健康接口会返回实际图片存储类型。数据库迁移脚本会按当前存储配置迁移并校验图片对象。
+
+
+### 任务队列
+
+本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ，应用会把数据库中的排队任务按任务 ID 投递到 Redis；worker 使用数据库条件更新领取任务，避免同一任务被重复执行。Redis 连接中断时，数据库里的 queued 任务会由后台定时器重新投递。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。当前 worker 仍随应用进程启动，正式横向扩容前还需完成多实例状态同步和独立 worker 部署。

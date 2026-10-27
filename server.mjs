@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { openDatabase, applyPostgresMigrations } from './db-adapter.mjs';
 import { openAssetStorage } from './asset-storage.mjs';
+import { createJobQueue } from './job-queue.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
@@ -206,7 +207,7 @@ async function callImageProvider(input,signal){
 }
 function transientError(error){return error.name==='AbortError'||[429,500,502,503,504].includes(Number(error.status));}
 async function runJob(job){
-  job.status='running';job.startedAt=Date.now();job.progress=5;job.attempts=(job.attempts||0)+1;await saveJob(job);jobsById.set(job.id,{...job,controller:null});const controller=new AbortController();jobsById.get(job.id).controller=controller;
+  jobsById.set(job.id,{...job,controller:null});const controller=new AbortController();jobsById.get(job.id).controller=controller;
   const timeoutMs=job.type==='storyboard'?120000:180000;const timeout=setTimeout(()=>controller.abort(),timeoutMs);
   try {
     let result;
@@ -214,18 +215,65 @@ async function runJob(job){
       try{result=job.type==='storyboard'?await callStoryboard(job.input,controller.signal):job.type==='panel_image'?await callImageProvider(job.input,controller.signal):{mode:'mock'};break;}
       catch(error){if(attempt>=2||!transientError(error)||controller.signal.aborted)throw error;await new Promise((resolve,reject)=>{const t=setTimeout(resolve,500*2**attempt);controller.signal.addEventListener('abort',()=>{clearTimeout(t);reject(Object.assign(new Error('取消'),{name:'AbortError'}))},{once:true});});job.attempts++;}
     }
-    if(job.status==='cancelled'||job.status==='cancel_requested')job.status='cancelled';else {job.status='succeeded';job.progress=100;job.result={...result,completedAt:Date.now()};}
+    const persisted=await getJob(job.id);
+    if(job.status==='cancelled'||persisted?.status==='cancel_requested')job.status='cancelled';
+    else {job.status='succeeded';job.progress=100;job.result={...result,completedAt:Date.now()};}
     job.finishedAt=Date.now();await saveJob(job);
-    if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.versions=p.versions||[1];p.imageVersions=p.imageVersions||[];const v=p.versions.length?Math.max(...p.versions)+1:1;p.versions.push(v);p.version=v;if(job.result?.imageUrl)p.imageVersions.push({version:v,url:job.result.imageUrl,assetId:job.result.assetId,createdAt:Date.now()});p.generationStatus='succeeded';p.appliedJobId=job.id;w.updatedAt=Date.now();await saveState(state);}}
-  } catch(error){if(job.status==='cancelled'||job.status==='cancel_requested')job.status='cancelled';else{job.status='failed';job.progress=0;job.error={code:error.name==='AbortError'?'PROVIDER_TIMEOUT':error.code||'PROVIDER_ERROR',message:error.name==='AbortError'?'模型任务已超时或取消':error.message||'任务失败',retryable:transientError(error)};}job.finishedAt=Date.now();await saveJob(job);if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.generationStatus=job.status;p.lastJobError=job.error?.message||null;w.updatedAt=Date.now();await saveState(state);}}}
-  finally{clearTimeout(timeout);jobsById.delete(job.id);if(job.type==='panel_image')runningImages--;schedulePump();}
+    if(job.type==='panel_image'){
+      const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);
+      if(p){
+        if(job.status==='succeeded'){p.versions=p.versions||[1];p.imageVersions=p.imageVersions||[];const v=p.versions.length?Math.max(...p.versions)+1:1;p.versions.push(v);p.version=v;if(job.result?.imageUrl)p.imageVersions.push({version:v,url:job.result.imageUrl,assetId:job.result.assetId,createdAt:Date.now()});p.generationStatus='succeeded';p.appliedJobId=job.id;}
+        else p.generationStatus='cancelled';
+        w.updatedAt=Date.now();await saveState(state);
+      }
+    }
+  } catch(error){
+    let persisted=null;try{persisted=await getJob(job.id);}catch{}
+    if(job.status==='cancelled'||persisted?.status==='cancel_requested')job.status='cancelled';
+    else{job.status='failed';job.progress=0;job.error={code:error.name==='AbortError'?'PROVIDER_TIMEOUT':error.code||'PROVIDER_ERROR',message:error.name==='AbortError'?'模型任务已超时或取消':error.message||'任务失败',retryable:transientError(error)};}
+    job.finishedAt=Date.now();await saveJob(job);
+    if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.generationStatus=job.status;p.lastJobError=job.error?.message||null;w.updatedAt=Date.now();await saveState(state);}}
+  } finally {clearTimeout(timeout);jobsById.delete(job.id);if(job.type==='panel_image'&&jobQueue?.kind==='in-process')runningImages--;schedulePump();}
 }
-function schedulePump(){if(pumpScheduled)return;pumpScheduled=true;setImmediate(()=>{pumpScheduled=false;void pumpQueue();});}
-async function pumpQueue(){const rows=await db.prepare("SELECT * FROM jobs WHERE owner_id=? AND status='queued' ORDER BY created_at LIMIT 20").all(ownerId);for(const row of rows){const job=rowToJob(row);if(job.type==='panel_image'&&runningImages>=2)continue;if(job.type==='panel_image')runningImages++;void runJob(job);}}
+async function claimQueuedJob(jobId){
+  const row=await db.prepare("UPDATE jobs SET status='running',started_at=?,progress=5,attempts=attempts+1 WHERE id=? AND owner_id=? AND status='queued' RETURNING *").get(Date.now(),jobId,ownerId);
+  return row?rowToJob(row):null;
+}
+async function processQueuedJob(jobId,imageSlotReserved=false){
+  let job;
+  try { job=await claimQueuedJob(jobId); }
+  catch(error){if(imageSlotReserved)runningImages--;throw error;}
+  if(!job){if(imageSlotReserved)runningImages--;return;}
+  try { await runJob(job); }
+  catch(error){
+    await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL,progress=0 WHERE id=? AND owner_id=? AND status='running'").run(job.id,ownerId).catch(()=>{});
+    if(jobQueue.kind==='in-process')setTimeout(schedulePump,1500).unref();
+    throw error;
+  }
+}
+const queueConcurrency=Math.max(1,Math.min(8,Number(process.env.JOB_CONCURRENCY)||2));
+const jobQueue=await createJobQueue({redisUrl:process.env.REDIS_URL||'',concurrency:queueConcurrency,processJob:processQueuedJob});
+function schedulePump(){if(pumpScheduled)return;pumpScheduled=true;setImmediate(()=>{pumpScheduled=false;void pumpQueue().catch(error=>console.error(JSON.stringify({component:'job-dispatcher',code:error.code||'DISPATCH_ERROR'})));});}
+async function pumpQueue(){
+  const rows=await db.prepare("SELECT * FROM jobs WHERE owner_id=? AND status='queued' ORDER BY created_at LIMIT 20").all(ownerId);
+  for(const row of rows){
+    const job=rowToJob(row);
+    if(jobQueue.kind==='bullmq'){try{await jobQueue.enqueue(job);}catch(error){console.error(JSON.stringify({component:'job-dispatcher',jobId:job.id,code:error.code||'REDIS_ENQUEUE_ERROR'}));}continue;}
+    if(job.type==='panel_image'&&runningImages>=2)continue;
+    const imageSlotReserved=job.type==='panel_image';
+    if(imageSlotReserved)runningImages++;
+    void processQueuedJob(job.id,imageSlotReserved).catch(error=>console.error(JSON.stringify({component:'job-worker',jobId:job.id,code:error.code||'JOB_PROCESS_ERROR'})));
+  }
+}
+let queueRecoveryTimer;
+if(jobQueue.kind==='bullmq'){
+  const interval=Math.max(1000,Number(process.env.JOB_DISPATCH_INTERVAL_MS)||5000);
+  queueRecoveryTimer=setInterval(schedulePump,interval);queueRecoveryTimer.unref();
+}
 // Expire works after the documented 30-day soft-delete recovery window.
 const expiry=Date.now()-30*86400_000,previousCount=state.works.length;state.works=state.works.filter(w=>!w.deletedAt||w.deletedAt>expiry);if(state.works.length!==previousCount)await saveState(state);
 // Recover unfinished work after process restarts. Inputs and job identity remain stable.
-await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status IN ('queued','running','cancel_requested')").run(ownerId);await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());
+await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status='running'").run(ownerId);await db.prepare("UPDATE jobs SET status='cancelled',finished_at=? WHERE owner_id=? AND status='cancel_requested'").run(Date.now(),ownerId);await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());
 schedulePump();
 function safeConfig(){return {llm:{provider:configured('storyboard')?'connected':'mock',model:configured('storyboard')?providerConfig.llmModel:null},image:{provider:configured('panel_image')?'connected':'mock',model:configured('panel_image')?providerConfig.imageModel:null}};}
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp'};
@@ -252,7 +300,7 @@ const server=createServer(async(req,res)=>{
     if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&path.startsWith('/assets/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&!sameOrigin(req)&&!['GET','HEAD','OPTIONS'].includes(req.method))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
-    if(req.method==='GET'&&path==='/api/v1/health')return send(res,200,{status:'ok',storage:db.kind,assets:assetStorage.kind,queue:db.kind==='postgres'?'in-process-worker/postgres-jobs':'in-process-worker/sqlite-jobs',revision,...safeConfig()});
+    if(req.method==='GET'&&path==='/api/v1/health')return send(res,200,{status:'ok',storage:db.kind,assets:assetStorage.kind,queue:jobQueue.kind,revision,...safeConfig()});
     if(req.method==='GET'&&path==='/api/v1/config')return send(res,200,safeConfig());
     if(path==='/api/v1/state'&&req.method==='GET')return send(res,200,{state,revision});
     if(path==='/api/v1/state'&&req.method==='PUT'){
@@ -308,4 +356,4 @@ const server=createServer(async(req,res)=>{
   }catch(error){const status=error.status||500;console.error(JSON.stringify({requestId,code:error.code||'INTERNAL_ERROR',status}));return send(res,status,{error:{code:status===413?'PAYLOAD_TOO_LARGE':status===400?'BAD_JSON':error.code||'INTERNAL_ERROR',message:status>=500?'服务暂时不可用':error.message||'请求无效'},requestId});}
 });
 server.listen(port,host,()=>console.log(`漫工厂 AI 已启动：http://${host}:${port}`));
-for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ server.close(async()=>{ try { await db.close(); } finally { await assetStorage.close(); process.exit(0); } }); setTimeout(()=>process.exit(1),10_000).unref(); });
+for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ server.close(async()=>{ try { if(queueRecoveryTimer)clearInterval(queueRecoveryTimer); await jobQueue.close(); await db.close(); } finally { await assetStorage.close(); process.exit(0); } }); setTimeout(()=>process.exit(1),10_000).unref(); });

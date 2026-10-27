@@ -14,16 +14,35 @@ services:
       timeout: 3s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   app:
     build: .
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       HOST: 0.0.0.0
       PORT: 4173
       DATABASE_URL: postgresql://mangongchang:${POSTGRES_PASSWORD}@postgres:5432/mangongchang
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JOB_CONCURRENCY: ${JOB_CONCURRENCY:-2}
+      JOB_DISPATCH_INTERVAL_MS: ${JOB_DISPATCH_INTERVAL_MS:-5000}
       AUTH_PASSWORD: ${AUTH_PASSWORD:?Set AUTH_PASSWORD in .env}
       LOCAL_STORAGE_DIR: /data/assets
       S3_ENDPOINT: ${S3_ENDPOINT:-}
@@ -39,4 +58,5 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
   comic_assets:
