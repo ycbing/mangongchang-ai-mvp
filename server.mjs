@@ -293,6 +293,7 @@ await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NU
 schedulePump();
 function safeConfig(){return {llm:{provider:configured('storyboard')?'connected':'mock',model:configured('storyboard')?providerConfig.llmModel:null},image:{provider:configured('panel_image')?'connected':'mock',model:configured('panel_image')?providerConfig.imageModel:null}};}
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp'};
+const publicFiles=new Set(['index.html','app.js']);
 function send(res,code,body,headers={}){res.writeHead(code,{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...headers});res.end(JSON.stringify(body));}
 async function bodyJson(req){let raw='';for await(const chunk of req){raw+=chunk;if(Buffer.byteLength(raw)>maxBodyBytes)throw Object.assign(new Error('请求内容过大'),{status:413});}try{return raw?JSON.parse(raw):{};}catch{throw Object.assign(new Error('JSON 格式无效'),{status:400});}}
 function rateLimit(req){const key=req.socket.remoteAddress||'local',now=Date.now(),old=rateLimits.get(key)||[];const recent=old.filter(t=>now-t<60000);if(recent.length>=300)return false;recent.push(now);rateLimits.set(key,recent);if(rateLimits.size>5000)rateLimits.delete(rateLimits.keys().next().value);return true;}
@@ -374,7 +375,15 @@ const server=createServer(async(req,res)=>{
         return res.writeHead(200,{'content-type':responseMime,'cache-control':'private, max-age=86400','x-content-type-options':'nosniff'}).end(data);
       } catch(error){if(error.code==='ENOENT'||error.name==='NoSuchKey'||error.$metadata?.httpStatusCode===404)return send(res,404,{error:{code:'NOT_FOUND',message:'图片资源不存在'},requestId});throw error;}
     }
-    if(req.method==='GET'&&!path.startsWith('/api/')){const requested=path==='/'?'index.html':path.slice(1),file=resolve(root,normalize(requested));if(file!==root&&!file.startsWith(root+sep))return send(res,403,{error:{code:'FORBIDDEN',message:'禁止访问'},requestId});try{const data=await readFile(file);res.writeHead(200,{'content-type':mime[extname(file)]||'application/octet-stream','x-content-type-options':'nosniff','content-security-policy':"default-src 'self' data: blob:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'"});return res.end(data);}catch{return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});}}
+    if(req.method==='GET'&&!path.startsWith('/api/')){
+      const requested=path==='/'?'index.html':path.slice(1);
+      if(!publicFiles.has(requested))return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});
+      try{
+        const data=await readFile(join(root,requested));
+        res.writeHead(200,{'content-type':mime[extname(requested)]||'application/octet-stream','x-content-type-options':'nosniff','content-security-policy':"default-src 'self' data: blob:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"});
+        return res.end(data);
+      }catch{return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});}
+    }
     return send(res,404,{error:{code:'NOT_FOUND',message:'接口不存在'},requestId});
   }catch(error){const status=error.status||500;console.error(JSON.stringify({requestId,code:error.code||'INTERNAL_ERROR',status}));return send(res,status,{error:{code:status===413?'PAYLOAD_TOO_LARGE':status===400?'BAD_JSON':error.code||'INTERNAL_ERROR',message:status>=500?'服务暂时不可用':error.message||'请求无效'},requestId});}
 });

@@ -59,6 +59,8 @@ npm run db:import-sqlite
 
 设置 `AUTH_PASSWORD` 后启用一个共享访问密码。会话使用 HttpOnly、SameSite Strict Cookie，写操作校验请求来源。公网部署必须使用 HTTPS 和强密码。当前不提供注册、多用户、云端同步或多人协作。
 
+静态服务只开放 `index.html` 和 `app.js`；`.env`、数据库、源码、迁移和依赖目录不会通过页面路由发布。内容安全策略禁止内联脚本。
+
 ## API
 
 前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；错误响应包含 `error.code`、`error.message` 和 `requestId`。
