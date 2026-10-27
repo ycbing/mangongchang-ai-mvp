@@ -1,8 +1,9 @@
 import { createServer } from 'node:http';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { openDatabase, applyPostgresMigrations } from './db-adapter.mjs';
+import { openAssetStorage } from './asset-storage.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
@@ -43,7 +44,6 @@ const providerConfig = {
   imageApiKey: process.env.IMAGE_API_KEY || '', imageModel: process.env.IMAGE_MODEL || '',
   imageSize: process.env.IMAGE_SIZE || '1024x1536',
 };
-await mkdir(assetDir, { recursive: true });
 const db = await openDatabase({ databaseUrl: process.env.DATABASE_URL || '', databasePath: dbFile });
 if (db.kind === 'postgres') {
   await applyPostgresMigrations(db, join(root, 'migrations'));
@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, 
   const existingPanelWorkKey = existingPanelColumns.find(column => column.name === 'work_id');
   if (existingPanelIdKey?.pk === 1 && !existingPanelWorkKey?.pk) await db.exec('DROP TABLE panels; CREATE TABLE panels(id TEXT NOT NULL, work_id TEXT NOT NULL, order_index INTEGER NOT NULL, storyboard_json TEXT NOT NULL, layout_json TEXT NOT NULL, current_image_asset_id TEXT, generation_status TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(work_id,id), UNIQUE(work_id,order_index));');
 }
+const assetStorage = await openAssetStorage({ directory: assetDir });
 function defaultState() {
   return { schemaVersion:1, characters:[{id:'char-xfc',name:'小废柴',summary:'认真又想准时下班的普通上班族',look:'圆脸、黑色短发和两撮翘起的呆毛；宽松浅黄色卫衣、深蓝长裤、白色运动鞋；胸前有绿色叶片徽章。',style:'清爽二维网络漫画，暖色平涂，深棕描边，柔和浅阴影。',archivedAt:null}], works:[], activeId:null };
 }
@@ -182,7 +183,14 @@ async function callStoryboard(input,signal){
 }
 function imageExtension(contentType){const type=String(contentType).split(';')[0].trim().toLowerCase();if(type==='image/png')return ['.png',type];if(type==='image/jpeg'||type==='image/jpg')return ['.jpg','image/jpeg'];if(type==='image/webp')return ['.webp',type];throw new Error('图片格式不受支持（请使用 PNG、JPEG 或 WebP）');}
 function verifyImage(bytes,mime){const b=Buffer.from(bytes);const png=b.length>24&&b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));const jpeg=b.length>3&&b[0]===255&&b[1]===216&&b[2]===255;const webp=b.length>12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WEBP';if(!((mime==='image/png'&&png)||(mime==='image/jpeg'&&jpeg)||(mime==='image/webp'&&webp)))throw new Error('图片文件内容与类型不一致');if(png){const w=b.readUInt32BE(16),h=b.readUInt32BE(20);if(w>10000||h>10000||w*h>60_000_000)throw new Error('图片尺寸超出限制');return {width:w,height:h};}return {width:null,height:null};}
-async function saveImageAsset(bytes,contentType,metadata={}){if(bytes.byteLength>maxImageBytes*1.5)throw new Error('生成图片超过大小限制');const [suffix,mime]=imageExtension(contentType);const dimensions=verifyImage(bytes,mime);const name=`${randomUUID()}${suffix}`,id=randomUUID(),buffer=Buffer.from(bytes);await writeFile(join(assetDir,name),buffer,{flag:'wx'});await db.prepare('INSERT INTO assets(id,owner_id,work_id,panel_id,kind,storage_key,mime_type,width,height,size_bytes,checksum,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,ownerId,metadata.workId||null,metadata.panelId||null,metadata.kind||'panel_image',name,mime,dimensions.width,dimensions.height,buffer.byteLength,createHash('sha256').update(buffer).digest('hex'),JSON.stringify(metadata),Date.now());return {assetId:id,imageUrl:`/assets/${name}`,mimeType:mime,sizeBytes:buffer.byteLength,...dimensions};}
+async function saveImageAsset(bytes,contentType,metadata={}){
+  if(bytes.byteLength>maxImageBytes*1.5)throw new Error('生成图片超过大小限制');
+  const [suffix,mime]=imageExtension(contentType),dimensions=verifyImage(bytes,mime),name=`${randomUUID()}${suffix}`,id=randomUUID(),buffer=Buffer.from(bytes),checksum=createHash('sha256').update(buffer).digest('hex');
+  await assetStorage.put(name,buffer,mime);
+  try { await db.prepare('INSERT INTO assets(id,owner_id,work_id,panel_id,kind,storage_key,mime_type,width,height,size_bytes,checksum,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,ownerId,metadata.workId||null,metadata.panelId||null,metadata.kind||'panel_image',name,mime,dimensions.width,dimensions.height,buffer.byteLength,checksum,JSON.stringify(metadata),Date.now()); }
+  catch(error){await assetStorage.delete(name).catch(()=>{});throw error;}
+  return {assetId:id,imageUrl:`/assets/${name}`,mimeType:mime,sizeBytes:buffer.byteLength,...dimensions};
+}
 function privateAddress(address){if(isIP(address)===4){const a=address.split('.').map(Number);return a[0]===10||a[0]===127||a[0]===0||a[0]===169&&a[1]===254||a[0]===172&&a[1]>=16&&a[1]<=31||a[0]===192&&a[1]===168||a[0]>=224;}if(isIP(address)===6){const x=address.toLowerCase();return x==='::1'||x==='::'||x.startsWith('fc')||x.startsWith('fd')||x.startsWith('fe80')||x.startsWith('::ffff:127.');}return true;}
 async function safeImageFetch(value,signal){let url;try{url=new URL(value);}catch{throw new Error('绘图模型返回的图片地址无效');}for(let redirects=0;redirects<=4;redirects++){if(url.protocol!=='https:'||url.username||url.password)throw new Error('绘图模型图片地址必须使用 HTTPS');if(url.hostname==='localhost'||url.hostname.endsWith('.localhost'))throw new Error('绘图模型图片地址无效');const addresses=await lookup(url.hostname,{all:true}).catch(()=>[]);if(!addresses.length||addresses.some(x=>privateAddress(x.address)))throw new Error('绘图模型图片地址无法安全访问');const response=await fetch(url,{signal,redirect:'manual'});if(response.status>=300&&response.status<400){if(redirects===4)throw new Error('图片下载重定向次数过多');const location=response.headers.get('location');if(!location)throw new Error('图片地址重定向无效');url=new URL(location,url);continue;}return response;}throw new Error('图片下载失败');}
 async function callImageProvider(input,signal){
@@ -244,7 +252,7 @@ const server=createServer(async(req,res)=>{
     if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&path.startsWith('/assets/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&!sameOrigin(req)&&!['GET','HEAD','OPTIONS'].includes(req.method))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
-    if(req.method==='GET'&&path==='/api/v1/health')return send(res,200,{status:'ok',storage:db.kind,queue:db.kind==='postgres'?'in-process-worker/postgres-jobs':'in-process-worker/sqlite-jobs',revision,...safeConfig()});
+    if(req.method==='GET'&&path==='/api/v1/health')return send(res,200,{status:'ok',storage:db.kind,assets:assetStorage.kind,queue:db.kind==='postgres'?'in-process-worker/postgres-jobs':'in-process-worker/sqlite-jobs',revision,...safeConfig()});
     if(req.method==='GET'&&path==='/api/v1/config')return send(res,200,safeConfig());
     if(path==='/api/v1/state'&&req.method==='GET')return send(res,200,{state,revision});
     if(path==='/api/v1/state'&&req.method==='PUT'){
@@ -286,10 +294,18 @@ const server=createServer(async(req,res)=>{
     const jobMatch=path.match(/^\/api\/v1\/jobs\/([^/]+)$/);
     if(jobMatch&&req.method==='GET'){const job=await getJob(jobMatch[1]);return job?send(res,200,job):send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});}
     const assetMatch=path.match(/^\/assets\/([0-9a-f-]+\.(?:png|jpg|webp))$/i);
-    if(req.method==='GET'&&assetMatch){try{const data=await readFile(join(assetDir,assetMatch[1]));return res.writeHead(200,{'content-type':mime[extname(assetMatch[1])],'cache-control':'private, max-age=86400','x-content-type-options':'nosniff'}).end(data);}catch{return send(res,404,{error:{code:'NOT_FOUND',message:'图片资源不存在'},requestId});}}
+    if(req.method==='GET'&&assetMatch){
+      try {
+        const row=await db.prepare('SELECT storage_key,mime_type FROM assets WHERE owner_id=? AND storage_key=?').get(ownerId,assetMatch[1]);
+        const data=row?await assetStorage.get(row.storage_key,maxImageBytes*1.5):assetStorage.kind==='local'?await assetStorage.get(assetMatch[1],maxImageBytes*1.5):null;
+        if(!data)return send(res,404,{error:{code:'NOT_FOUND',message:'图片资源不存在'},requestId});
+        const responseMime=['image/png','image/jpeg','image/webp'].includes(row?.mime_type)?row.mime_type:mime[extname(assetMatch[1])];
+        return res.writeHead(200,{'content-type':responseMime,'cache-control':'private, max-age=86400','x-content-type-options':'nosniff'}).end(data);
+      } catch(error){if(error.code==='ENOENT'||error.name==='NoSuchKey'||error.$metadata?.httpStatusCode===404)return send(res,404,{error:{code:'NOT_FOUND',message:'图片资源不存在'},requestId});throw error;}
+    }
     if(req.method==='GET'&&!path.startsWith('/api/')){const requested=path==='/'?'index.html':path.slice(1),file=resolve(root,normalize(requested));if(file!==root&&!file.startsWith(root+sep))return send(res,403,{error:{code:'FORBIDDEN',message:'禁止访问'},requestId});try{const data=await readFile(file);res.writeHead(200,{'content-type':mime[extname(file)]||'application/octet-stream','x-content-type-options':'nosniff','content-security-policy':"default-src 'self' data: blob:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'"});return res.end(data);}catch{return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});}}
     return send(res,404,{error:{code:'NOT_FOUND',message:'接口不存在'},requestId});
   }catch(error){const status=error.status||500;console.error(JSON.stringify({requestId,code:error.code||'INTERNAL_ERROR',status}));return send(res,status,{error:{code:status===413?'PAYLOAD_TOO_LARGE':status===400?'BAD_JSON':error.code||'INTERNAL_ERROR',message:status>=500?'服务暂时不可用':error.message||'请求无效'},requestId});}
 });
 server.listen(port,host,()=>console.log(`漫工厂 AI 已启动：http://${host}:${port}`));
-for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ server.close(async()=>{ await db.close(); process.exit(0); }); setTimeout(()=>process.exit(1),10_000).unref(); });
+for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ server.close(async()=>{ try { await db.close(); } finally { await assetStorage.close(); process.exit(0); } }); setTimeout(()=>process.exit(1),10_000).unref(); });
