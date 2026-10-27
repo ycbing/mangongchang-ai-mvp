@@ -1,7 +1,7 @@
 const queueName = 'mangongchang-ai-jobs';
 
 export async function createJobQueue({ redisUrl, concurrency = 2, processJob }) {
-  if (!redisUrl) return { kind: 'in-process', async enqueue() {}, async close() {} };
+  if (!redisUrl) return { kind: 'in-process', async enqueue() {}, async health() { return true; }, async close() {} };
 
   const [{ Queue, Worker }, redisModule] = await Promise.all([import('bullmq'), import('ioredis')]);
   const Redis = redisModule.default;
@@ -38,6 +38,10 @@ export async function createJobQueue({ redisUrl, concurrency = 2, processJob }) 
   }
   return {
     kind: 'bullmq',
+    async health() {
+      try { return (await connection.ping()) === 'PONG'; }
+      catch { return false; }
+    },
     async enqueue(job) {
       await queue.add(job.type, { jobId: job.id }, { jobId: job.id });
     },

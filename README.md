@@ -70,7 +70,7 @@ npm run db:import-sqlite
 docker compose up --build -d
 ```
 
-Compose 会先等待 PostgreSQL 和 Redis 健康，再启动应用并自动执行数据库迁移；应用容器也会通过 `/api/v1/health` 健康检查。可用 `docker compose ps` 查看服务健康状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；应用启动会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
+Compose 会先等待 PostgreSQL 和 Redis 健康，再启动应用并自动执行数据库迁移；`/api/v1/health` 会检查数据库与 Redis 的连接，依赖不可用时返回 HTTP 503。应用容器用该接口做健康检查，可用 `docker compose ps` 查看服务状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；应用启动会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
 
 ### S3 兼容图片存储
 

@@ -300,7 +300,14 @@ const server=createServer(async(req,res)=>{
     if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&path.startsWith('/assets/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&!sameOrigin(req)&&!['GET','HEAD','OPTIONS'].includes(req.method))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
-    if(req.method==='GET'&&path==='/api/v1/health')return send(res,200,{status:'ok',storage:db.kind,assets:assetStorage.kind,queue:jobQueue.kind,revision,...safeConfig()});
+    if(req.method==='GET'&&path==='/api/v1/health'){
+      const [databaseOk,queueOk]=await Promise.all([
+        db.prepare('SELECT 1 AS ok').get().then(()=>true).catch(()=>false),
+        jobQueue.health(),
+      ]);
+      const ready=databaseOk&&queueOk;
+      return send(res,ready?200:503,{status:ready?'ok':'degraded',checks:{database:databaseOk?'ok':'unavailable',queue:queueOk?'ok':'unavailable'},storage:db.kind,assets:assetStorage.kind,queue:jobQueue.kind,revision,...safeConfig()});
+    }
     if(req.method==='GET'&&path==='/api/v1/config')return send(res,200,safeConfig());
     if(path==='/api/v1/state'&&req.method==='GET')return send(res,200,{state,revision});
     if(path==='/api/v1/state'&&req.method==='PUT'){
