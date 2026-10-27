@@ -43,6 +43,7 @@ npm run db:import-sqlite
 - 分镜：OpenAI 兼容 `POST {LLM_BASE_URL}/chat/completions`，需支持 JSON object 响应。
 - 绘图：OpenAI 兼容 `POST {IMAGE_BASE_URL}/images/generations`，接受 PNG/JPEG/WebP base64 或 HTTPS 图片链接。
 - 未配置完整参数时，对应能力使用内置 mock 模式。
+- 模型 JSON 和生成图片均按配置上限流式读取；缺少 `Content-Length` 的响应也会在超过上限时中止。
 
 不同供应商对尺寸参数、JSON 响应和参考图的支持不同；当前参考图用于角色库预览，通用绘图端点仍以文字锚点为主。
 

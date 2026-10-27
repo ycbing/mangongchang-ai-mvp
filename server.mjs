@@ -169,6 +169,20 @@ function validProviderUrl(value){const url=new URL(value);if(!['https:','http:']
 function endpoint(base,path){return `${validProviderUrl(base)}/${path}`;}
 function readText(value,max=1200){return typeof value==='string'?value.trim().slice(0,max):'';}
 function normalizePanel(panel,index){return {index,scene:readText(panel?.scene,800),action:readText(panel?.action,800),camera:readText(panel?.camera,240),expression:readText(panel?.expression,240),dialogue:readText(panel?.dialogue,700),caption:readText(panel?.caption,700),sfx:readText(panel?.sfx,180),imagePrompt:readText(panel?.imagePrompt,1800),negativePrompt:readText(panel?.negativePrompt,1000),tone:readText(panel?.tone,40)||'hope'};}
+async function readLimitedBody(response,limit){
+  const declared=Number(response.headers.get('content-length')||0);
+  if(declared>limit)throw Object.assign(new Error('模型响应超过安全大小限制'),{code:'PROVIDER_RESPONSE_TOO_LARGE'});
+  const reader=response.body?.getReader();if(!reader)return Buffer.alloc(0);
+  const chunks=[];let total=0;
+  try{
+    while(true){const {done,value}=await reader.read();if(done)break;const chunk=Buffer.from(value);total+=chunk.byteLength;if(total>limit){await reader.cancel().catch(()=>{});throw Object.assign(new Error('模型响应超过安全大小限制'),{code:'PROVIDER_RESPONSE_TOO_LARGE'});}chunks.push(chunk)}
+  }finally{reader.releaseLock()}
+  return Buffer.concat(chunks,total);
+}
+async function readProviderJson(response,limit){
+  const bytes=await readLimitedBody(response,limit);
+  try{return JSON.parse(bytes.toString('utf8'))}catch{throw Object.assign(new Error('模型响应不是有效 JSON'),{code:'INVALID_PROVIDER_JSON'});}
+}
 async function callStoryboard(input,signal){
   if(!configured('storyboard'))return {mode:'mock'};
   const count=Math.max(1,Math.min(20,Number(input.panelCount)||8));
@@ -178,7 +192,7 @@ async function callStoryboard(input,signal){
   for(let repair=0;repair<2;repair++){
     const response=await request([{role:'system',content:system},{role:'user',content:repair?`修复上一条输出，使其成为有效 JSON，恰好 ${count} 格，并包含每格所需字段。仅输出 JSON。`+payload:payload}]);
     if(!response.ok){const e=new Error(`分镜模型请求失败（HTTP ${response.status}）`);e.status=response.status;throw e;}
-    const data=await response.json();let content=data?.choices?.[0]?.message?.content;if(Array.isArray(content))content=content.map(x=>x?.text||'').join('');
+    const data=await readProviderJson(response,2_000_000);let content=data?.choices?.[0]?.message?.content;if(Array.isArray(content))content=content.map(x=>x?.text||'').join('');
     try{content=String(content||'').trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');const result=JSON.parse(content);const required=['scene','action','camera','expression','dialogue','caption','sfx','imagePrompt','negativePrompt','tone'];if(typeof result.title!=='string'||!Array.isArray(result.panels)||result.panels.length!==count||result.panels.some(p=>!p||required.some(key=>typeof p[key]!=='string')))throw new Error();return {mode:'ai',title:readText(result.title,120),summary:readText(result.summary,500),panels:result.panels.map(normalizePanel)};}catch{if(repair)throw Object.assign(new Error('分镜模型返回格式异常，请重试或手动编辑'),{code:'INVALID_MODEL_OUTPUT'});}
   }
 }
@@ -198,12 +212,14 @@ async function callImageProvider(input,signal){
   if(!configured('panel_image'))return {mode:'mock'};
   const response=await fetch(endpoint(providerConfig.imageBaseUrl,'images/generations'),{method:'POST',signal,headers:{authorization:`Bearer ${providerConfig.imageApiKey}`,'content-type':'application/json'},body:JSON.stringify({model:providerConfig.imageModel,prompt:readText(input.prompt,5000),n:1,size:providerConfig.imageSize})});
   if(!response.ok){const e=new Error(`绘图模型请求失败（HTTP ${response.status}）`);e.status=response.status;throw e;}
-  const data=await response.json(),image=data?.data?.[0];
-  if(typeof image?.b64_json==='string'){const bytes=Buffer.from(image.b64_json,'base64');return {mode:'ai',...await saveImageAsset(bytes,'image/png',{workId:input.workId,panelId:input.panelId,kind:'panel_image'})};}
+  const data=await readProviderJson(response,maxImageBytes*2+1_000_000),image=data?.data?.[0];
+  if(typeof image?.b64_json==='string'){
+    if(image.b64_json.length>Math.ceil(maxImageBytes*1.5/3)*4)throw Object.assign(new Error('生成图片超过大小限制'),{code:'IMAGE_SIZE_LIMIT'});
+    const bytes=Buffer.from(image.b64_json,'base64');return {mode:'ai',...await saveImageAsset(bytes,'image/png',{workId:input.workId,panelId:input.panelId,kind:'panel_image'})};
+  }
   if(typeof image?.url!=='string')throw new Error('绘图模型没有返回图片');
   const imageResponse=await safeImageFetch(image.url,signal);if(!imageResponse.ok)throw new Error('无法下载绘图模型生成的图片');
-  const declared=Number(imageResponse.headers.get('content-length')||0);if(declared>maxImageBytes*1.5)throw new Error('生成图片超过大小限制');
-  const bytes=await imageResponse.arrayBuffer();return {mode:'ai',...await saveImageAsset(bytes,imageResponse.headers.get('content-type')||'',{workId:input.workId,panelId:input.panelId,kind:'panel_image'})};
+  const bytes=await readLimitedBody(imageResponse,maxImageBytes*1.5);return {mode:'ai',...await saveImageAsset(bytes,imageResponse.headers.get('content-type')||'',{workId:input.workId,panelId:input.panelId,kind:'panel_image'})};
 }
 function transientError(error){return error.name==='AbortError'||[429,500,502,503,504].includes(Number(error.status));}
 async function runJob(job){
