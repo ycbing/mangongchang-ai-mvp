@@ -326,6 +326,11 @@ async function isAuthenticated(req){if(!authEnabled)return true;const token=sess
 function sameOrigin(req){const source=req.headers.origin||req.headers.referer,host=req.headers.host;if(!source||!host)return false;try{const origin=new URL(source),requestHost=new URL(`http://${host}`).host;return ['http:','https:'].includes(origin.protocol)&&origin.host===requestHost;}catch{return false;}}
 const server=createServer(async(req,res)=>{
   const requestId=randomUUID();res.setHeader('x-request-id',requestId);
+  res.setHeader('x-content-type-options','nosniff');
+  res.setHeader('x-frame-options','DENY');
+  res.setHeader('referrer-policy','same-origin');
+  res.setHeader('permissions-policy','camera=(), microphone=(), geolocation=()');
+  res.setHeader('cache-control','no-store');
   let releaseStateOperation;
   try{
     if(!rateLimit(req))return send(res,429,{error:{code:'RATE_LIMITED',message:'请求过于频繁，请稍后再试'},requestId});
@@ -482,7 +487,7 @@ const server=createServer(async(req,res)=>{
       if(!publicFiles.has(requested))return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});
       try{
         const data=await readFile(join(root,requested));
-        res.writeHead(200,{'content-type':mime[extname(requested)]||'application/octet-stream','x-content-type-options':'nosniff','content-security-policy':"default-src 'self' data: blob:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"});
+        res.writeHead(200,{'content-type':mime[extname(requested)]||'application/octet-stream','cache-control':'no-cache','content-security-policy':"default-src 'self' data: blob:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"});
         return res.end(data);
       }catch{return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});}
     }

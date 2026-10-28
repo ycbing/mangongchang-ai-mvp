@@ -59,8 +59,18 @@ test('production auth enforces same-origin writes and emits secure session cooki
     }
     assert.ok(ready, `Server did not become ready: ${output}`);
 
+    const page = await request('/');
+    assert.equal(page.status, 200);
+    assert.equal(page.headers.get('cache-control'), 'no-cache');
+    assert.match(page.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
+    await page.arrayBuffer();
+
     const unauthenticated = await request('/api/v1/state');
     assert.equal(unauthenticated.status, 401);
+    assert.equal(unauthenticated.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(unauthenticated.headers.get('x-frame-options'), 'DENY');
+    assert.equal(unauthenticated.headers.get('referrer-policy'), 'same-origin');
+    assert.equal(unauthenticated.headers.get('permissions-policy'), 'camera=(), microphone=(), geolocation=()');
     await unauthenticated.arrayBuffer();
 
     const crossOriginLogin = await request('/api/v1/auth/login', {

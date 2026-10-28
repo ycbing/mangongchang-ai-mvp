@@ -79,7 +79,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 
 设置 `AUTH_PASSWORD` 后启用一个共享访问密码。会话使用 HttpOnly、SameSite Strict Cookie，写操作校验请求来源。公网部署必须使用 HTTPS 和强密码。当前不提供注册、多用户、云端同步或多人协作。
 
-静态服务只开放 `index.html`、`app.js` 和共用漫画 SVG 组件 `comic-art.js`；`.env`、数据库、其他源码、迁移和依赖目录不会通过页面路由发布。内容安全策略禁止内联脚本。
+静态服务只开放 `index.html`、`app.js`、共用漫画 SVG 组件 `comic-art.js` 和草稿提示组件 `draft-presentation.js`；`.env`、数据库、其他源码、迁移和依赖目录不会通过页面路由发布。页面使用禁止内联脚本的内容安全策略与 `no-cache` 重新验证；API 与页面统一返回 `nosniff`、禁止 iframe、同源 Referrer 和限制摄像头/麦克风/地理位置的 Permissions Policy。生产鉴权集成测试会校验这些响应头。
 
 ## API
 
