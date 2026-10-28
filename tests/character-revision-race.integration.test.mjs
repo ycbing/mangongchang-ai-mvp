@@ -144,7 +144,9 @@ test('character patch returns 409 when another PostgreSQL process commits after 
     if (lockHeld) await scopedAdmin?.query('ROLLBACK').catch(() => {});
     if (child && child.exitCode === null) {
       child.kill('SIGTERM');
-      const exited = await Promise.race([once(child, 'exit').then(() => true), new Promise(resolve => setTimeout(() => resolve(false), 12_000))]);
+      let shutdownTimer;
+      const exited = await Promise.race([once(child, 'exit').then(() => true), new Promise(resolve => { shutdownTimer = setTimeout(() => resolve(false), 12_000); })]);
+      clearTimeout(shutdownTimer);
       if (!exited) child.kill('SIGKILL');
       assert.ok(exited, `application did not gracefully exit after SIGTERM; ${serverOutput}`);
       assert.equal(child.exitCode, 0, `application exited unsuccessfully after SIGTERM; ${serverOutput}`);

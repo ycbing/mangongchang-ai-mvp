@@ -1,0 +1,136 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer } from 'node:net';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const accessPassword = 'test-only-production-password-32-chars';
+
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  return port;
+}
+
+test('production auth enforces same-origin writes and emits secure session cookies', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'mangongchang-auth-'));
+  const port = await freePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  let output = '';
+  const child = spawn(process.execPath, ['server.mjs'], {
+    cwd: root,
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      AUTH_PASSWORD: accessPassword,
+      DATABASE_URL: '',
+      DATABASE_PATH: join(directory, 'test.sqlite'),
+      LOCAL_STORAGE_DIR: join(directory, 'assets'),
+      REDIS_URL: '',
+      HOST: '127.0.0.1',
+      PORT: String(port),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
+  child.stderr.setEncoding('utf8').on('data', chunk => { output += chunk; });
+  const request = (path, init = {}) => fetch(`${baseUrl}${path}`, {
+    ...init,
+    headers: { connection: 'close', ...init.headers },
+  });
+
+  try {
+    let ready = false;
+    for (let attempt = 0; attempt < 200; attempt++) {
+      if (child.exitCode !== null) throw new Error(`Server exited before ready: ${output}`);
+      try {
+        const response = await request('/api/v1/auth/status');
+        if (response.ok) { await response.arrayBuffer(); ready = true; break; }
+        await response.arrayBuffer();
+      } catch {}
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(ready, `Server did not become ready: ${output}`);
+
+    const unauthenticated = await request('/api/v1/state');
+    assert.equal(unauthenticated.status, 401);
+    await unauthenticated.arrayBuffer();
+
+    const crossOriginLogin = await request('/api/v1/auth/login', {
+      method: 'POST',
+      headers: { origin: 'https://evil.example', 'content-type': 'application/json' },
+      body: JSON.stringify({ password: accessPassword }),
+    });
+    assert.equal(crossOriginLogin.status, 403);
+    await crossOriginLogin.arrayBuffer();
+
+    const login = await request('/api/v1/auth/login', {
+      method: 'POST',
+      headers: { origin: baseUrl, 'content-type': 'application/json' },
+      body: JSON.stringify({ password: accessPassword }),
+    });
+    assert.equal(login.status, 200);
+    const cookieHeader = login.headers.get('set-cookie') || '';
+    assert.match(cookieHeader, /HttpOnly/);
+    assert.match(cookieHeader, /SameSite=Strict/);
+    assert.match(cookieHeader, /Secure/);
+    const cookie = cookieHeader.split(';', 1)[0];
+    await login.arrayBuffer();
+
+    const state = await request('/api/v1/state', { headers: { cookie } });
+    assert.equal(state.status, 200);
+    await state.arrayBuffer();
+
+    const crossOriginWrite = await request('/api/v1/state', {
+      method: 'PUT',
+      headers: { cookie, origin: 'https://evil.example', 'content-type': 'application/json' },
+      body: JSON.stringify({ works: [], characters: [], revision: 1 }),
+    });
+    assert.equal(crossOriginWrite.status, 403);
+    await crossOriginWrite.arrayBuffer();
+
+    const logout = await request('/api/v1/auth/logout', {
+      method: 'POST',
+      headers: { cookie, origin: baseUrl },
+    });
+    assert.equal(logout.status, 200);
+    assert.match(logout.headers.get('set-cookie') || '', /Max-Age=0/);
+    await logout.arrayBuffer();
+
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const bad = await request('/api/v1/auth/login', {
+        method: 'POST',
+        headers: { origin: baseUrl, 'content-type': 'application/json' },
+        body: JSON.stringify({ password: 'incorrect password' }),
+      });
+      assert.equal(bad.status, 401);
+      await bad.arrayBuffer();
+    }
+    const rateLimited = await request('/api/v1/auth/login', {
+      method: 'POST',
+      headers: { origin: baseUrl, 'content-type': 'application/json' },
+      body: JSON.stringify({ password: accessPassword }),
+    });
+    assert.equal(rateLimited.status, 429);
+    assert.equal(rateLimited.headers.get('retry-after'), '900');
+    await rateLimited.arrayBuffer();
+  } finally {
+    if (child.exitCode === null) {
+      child.kill('SIGTERM');
+      let shutdownTimer;
+      const exited = await Promise.race([once(child, 'exit').then(() => true), new Promise(resolve => { shutdownTimer = setTimeout(() => resolve(false), 12_000); })]);
+      clearTimeout(shutdownTimer);
+      if (!exited) child.kill('SIGKILL');
+      assert.ok(exited, `Server did not gracefully exit after SIGTERM: ${output}`);
+      assert.equal(child.exitCode, 0, `Server exited unsuccessfully: ${output}`);
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
