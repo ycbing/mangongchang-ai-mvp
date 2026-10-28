@@ -6,3 +6,10 @@ export function boundedInteger(name, fallback, min, max, env = process.env) {
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer between ${min} and ${max}`);
   return value;
 }
+
+export function validateProductionAuth(env = process.env) {
+  if (env.NODE_ENV !== 'production') return;
+  const password = env.AUTH_PASSWORD || '';
+  if (!password) throw new Error('AUTH_PASSWORD is required in production');
+  if ([...password].length < 16) throw new Error('AUTH_PASSWORD must contain at least 16 characters in production');
+}

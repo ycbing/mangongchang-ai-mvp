@@ -10,7 +10,7 @@ import { validateCanvasSettings, validateCharacterInput } from './validation.mjs
 import { mutateSnapshot, persistSnapshot } from './state-store.mjs';
 import { createCompletedExport, listWorkExports } from './export-store.mjs';
 import { normalizeExportOptions, renderComicExports } from './export-renderer.mjs';
-import { boundedInteger } from './runtime-config.mjs';
+import { boundedInteger, validateProductionAuth } from './runtime-config.mjs';
 import { verifyImage } from './image-validation.mjs';
 import { safeImageFetch } from './safe-image-fetch.mjs';
 import { syncDatabaseProjection } from './projection-store.mjs';
@@ -40,6 +40,7 @@ const maxBodyBytes = boundedInteger('MAX_REQUEST_MB', 20, 1, 200) * 1_000_000;
 const maxImageBytes = boundedInteger('MAX_IMAGE_UPLOAD_MB', 10, 1, 100) * 1_000_000;
 const ownerId = 'local-owner';
 const authPassword = process.env.AUTH_PASSWORD || '';
+validateProductionAuth(process.env);
 const authEnabled = authPassword.length > 0;
 const sessionMs = boundedInteger('AUTH_SESSION_DAYS', 7, 1, 30) * 86400_000;
 const jobsById = new Map();

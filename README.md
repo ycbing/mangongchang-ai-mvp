@@ -17,7 +17,7 @@ npm start
 
 ## PostgreSQL 部署
 
-配置 PostgreSQL 连接串并设置单账号访问密码：
+配置 PostgreSQL 连接串并设置至少 16 个字符的单账号访问密码（生产环境未设置或过短时，应用会拒绝启动）：
 
 ```env
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require
