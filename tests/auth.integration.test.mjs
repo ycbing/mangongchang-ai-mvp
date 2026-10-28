@@ -88,6 +88,13 @@ test('auth enforces same-origin writes and emits secure session cookies when req
     assert.equal(unauthenticated.headers.get('permissions-policy'), 'camera=(), microphone=(), geolocation=()');
     await unauthenticated.arrayBuffer();
 
+    const readiness = await request('/healthz');
+    assert.equal(readiness.status, 200);
+    assert.deepEqual(await readiness.json(), { status: 'ok' });
+    const privateHealth = await request('/api/v1/health');
+    assert.equal(privateHealth.status, 401);
+    await privateHealth.arrayBuffer();
+
     const crossOriginLogin = await request('/api/v1/auth/login', {
       method: 'POST',
       headers: { origin: 'https://evil.example', 'content-type': 'application/json' },

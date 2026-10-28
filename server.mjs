@@ -314,6 +314,11 @@ async function recoverStaleJobs(){const staleBefore=Date.now()-5*60_000;await re
 if(serviceRole==='worker')await recoverStaleJobs();
 if(serviceRole!=='worker'){await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());schedulePump();}
 function safeConfig(){return {llm:{provider:configured('storyboard')?'connected':'mock',model:configured('storyboard')?providerConfig.llmModel:null},image:{provider:configured('panel_image')?'connected':'mock',model:configured('panel_image')?providerConfig.imageModel:null}};}
+async function dependencyHealth(){const [databaseOk,queueOk,assetsOk]=await Promise.all([
+  db.prepare('SELECT 1 AS ok').get().then(()=>true).catch(()=>false),
+  Promise.resolve().then(()=>jobQueue.health()).catch(()=>false),
+  Promise.resolve().then(()=>assetStorage.health()).catch(()=>false),
+]);return {databaseOk,queueOk,assetsOk,ready:databaseOk&&queueOk&&assetsOk};}
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp'};
 const publicFiles=new Set(['index.html','app.js','comic-art.js','draft-presentation.js']);
 function send(res,code,body,headers={}){res.writeHead(code,{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...headers});res.end(JSON.stringify(body));}
@@ -336,6 +341,10 @@ const server=createServer(async(req,res)=>{
   try{
     if(!rateLimit(req))return send(res,429,{error:{code:'RATE_LIMITED',message:'请求过于频繁，请稍后再试'},requestId});
     const url=new URL(req.url||'/',`http://${req.headers.host||'localhost'}`),path=decodeURIComponent(url.pathname);
+    if(req.method==='GET'&&path==='/healthz'){
+      const health=await dependencyHealth();
+      return send(res,health.ready?200:503,{status:health.ready?'ok':'unavailable'});
+    }
     if(path==='/api/v1/auth/status'&&req.method==='GET')return send(res,200,{enabled:authEnabled,authenticated:await isAuthenticated(req)});
     if(path==='/api/v1/auth/login'&&req.method==='POST'){
       if(!authEnabled)return send(res,400,{error:{code:'AUTH_DISABLED',message:'当前未启用账号鉴权'},requestId});if(!sameOrigin(req))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});if(!allowLoginAttempt(req))return send(res,429,{error:{code:'LOGIN_RATE_LIMITED',message:'尝试次数过多，请 15 分钟后再试'},requestId},{'retry-after':'900'});
@@ -349,13 +358,8 @@ const server=createServer(async(req,res)=>{
     const usesState=path==='/api/v1/state'||path==='/api/v1/works'||path.startsWith('/api/v1/works/')||path==='/api/v1/characters'||path.startsWith('/api/v1/characters/')||(path==='/api/v1/jobs'&&req.method==='POST');
     if(usesState){releaseStateOperation=await acquireStateOperation();await refreshStateCache();}
     if(req.method==='GET'&&path==='/api/v1/health'){
-      const [databaseOk,queueOk,assetsOk]=await Promise.all([
-        db.prepare('SELECT 1 AS ok').get().then(()=>true).catch(()=>false),
-        jobQueue.health(),
-        assetStorage.health(),
-      ]);
-      const ready=databaseOk&&queueOk&&assetsOk;
-      return send(res,ready?200:503,{status:ready?'ok':'degraded',checks:{database:databaseOk?'ok':'unavailable',queue:queueOk?'ok':'unavailable',assetStorage:assetsOk?'ok':'unavailable'},storage:db.kind,assets:assetStorage.kind,queue:jobQueue.kind,revision,...safeConfig()});
+      const health=await dependencyHealth();
+      return send(res,health.ready?200:503,{status:health.ready?'ok':'degraded',checks:{database:health.databaseOk?'ok':'unavailable',queue:health.queueOk?'ok':'unavailable',assetStorage:health.assetsOk?'ok':'unavailable'},storage:db.kind,assets:assetStorage.kind,queue:jobQueue.kind,revision,...safeConfig()});
     }
     if(req.method==='GET'&&path==='/api/v1/config')return send(res,200,safeConfig());
     if(path==='/api/v1/state'&&req.method==='GET')return send(res,200,{state,revision});

@@ -54,6 +54,8 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 
 恢复前先停止应用，并确认目标 PostgreSQL 数据库就是准备覆盖的库。通过 `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER` 和权限为 `0600` 的 `PGPASSFILE`（或 PostgreSQL service file）设置连接参数，然后运行 `pg_restore --clean --if-exists --no-owner --exit-on-error --dbname="$PGDATABASE" <备份目录>/database.dump` 恢复数据库，再将 `assets.tar.gz` 解压到配置的 `LOCAL_STORAGE_DIR`。恢复到空库后启动应用会自动应用缺失迁移；生产恢复应先在隔离环境演练，并按 `manifest.json` 核对文件 SHA-256。
 
+可将通过清单校验的本地备份目录封装成 AES-256-GCM 认证加密文件后再复制到异地。先在备份目录之外生成并妥善保管 32 字节密钥（密钥不要与加密备份放在同一位置）：`openssl rand -out /secure/location/mangongchang-backup.key 32`，并将权限设为 `0600`。设置 `BACKUP_KEY_FILE=/secure/location/mangongchang-backup.key` 后运行 `npm run backup:seal -- <备份目录> <异地暂存路径>/mangongchang.mgbak`；仅复制该加密文件到异地存储。恢复时把密钥和文件取回隔离机器，运行 `npm run backup:unseal -- <加密文件> <恢复目录>/mangongchang.tar.gz`，认证成功后再解包并按前文步骤恢复数据库和图片。错误密钥、文件损坏或已存在的输出文件都会拒绝发布；工具不覆盖目标文件。密钥需单独备份，否则加密副本无法恢复。
+
 ## 模型配置
 
 复制 `.env.example` 为 `.env`，填写模型服务参数后重启。密钥仅由服务端读取。
@@ -83,7 +85,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 
 ## API
 
-前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`assets/export-slices`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。作品 `GET/POST /works/:id/exports` 提供导出历史；POST 默认创建后台导出任务，切片与任务完成记录在事务中保存，并支持 `Idempotency-Key`。错误响应包含 `error.code`、`error.message` 和 `requestId`。
+前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`assets/export-slices`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。作品 `GET/POST /works/:id/exports` 提供导出历史；POST 默认创建后台导出任务，切片与任务完成记录在事务中保存，并支持 `Idempotency-Key`。错误响应包含 `error.code`、`error.message` 和 `requestId`。`GET /healthz` 仅返回最小就绪状态供容器探针使用；详细 `GET /api/v1/health` 检查数据库、任务队列、资源存储和模型配置，并受账号鉴权保护。
 
 ## Docker Compose 部署
 
@@ -93,7 +95,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 docker compose up --build -d
 ```
 
-Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动执行数据库迁移；独立 worker 在 Web 健康后启动，消费 BullMQ 任务。`/api/v1/health` 会检查数据库、队列和图片存储，依赖不可用时返回 HTTP 503；本地存储检查目录读写权限，S3 检查 bucket 可达性。可用 `docker compose ps` 查看 Web、worker 和依赖状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；Web 与 worker 都会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
+Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动执行数据库迁移；独立 worker 在 Web 健康后启动，消费 BullMQ 任务。容器使用无需登录且只返回最小状态的 `/healthz` 探针，依赖不可用时返回 HTTP 503；登录后的 `/api/v1/health` 提供数据库、队列和图片存储检查明细；本地存储检查目录读写权限，S3 检查 bucket 可达性。可用 `docker compose ps` 查看 Web、worker 和依赖状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；Web 与 worker 都会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
 
 ### S3 兼容图片存储
 
