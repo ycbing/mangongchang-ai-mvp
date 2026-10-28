@@ -16,7 +16,7 @@ function mapExport(row) {
   };
 }
 
-export async function createCompletedExport(db, { ownerId, workId, assetIds, width, height, options = {}, idempotencyKey = null }) {
+export async function createCompletedExport(db, { ownerId, workId, assetIds, width, height, options = {}, idempotencyKey = null, jobId = null }) {
   if (!Array.isArray(assetIds) || assetIds.length < 1 || assetIds.length > 20 || assetIds.some(id => typeof id !== 'string') || new Set(assetIds).size !== assetIds.length) {
     throw Object.assign(new Error('导出图片列表无效'), { status: 422, code: 'VALIDATION_ERROR' });
   }
@@ -29,6 +29,15 @@ export async function createCompletedExport(db, { ownerId, workId, assetIds, wid
 
   let outcome;
   await db.transaction(async tx => {
+    if (jobId) {
+      const runningJob = await tx.prepare(`SELECT id,type,status FROM jobs WHERE id=? AND owner_id=?${db.kind === 'postgres' ? ' FOR UPDATE' : ''}`).get(jobId, ownerId);
+      if (!runningJob || runningJob.type !== 'export') throw Object.assign(new Error('导出任务不存在'), { status: 404, code: 'NOT_FOUND' });
+      if (runningJob.status === 'succeeded') {
+        const existing = await tx.prepare('SELECT * FROM exports WHERE owner_id=? AND job_id=?').get(ownerId, jobId);
+        if (existing) { outcome = mapExport(existing); return; }
+      }
+      if (runningJob.status !== 'running') throw Object.assign(new Error('导出任务当前状态不允许完成'), { status: 409, code: 'JOB_STATE_CONFLICT' });
+    }
     if (idempotencyKey) {
       const prior = await tx.prepare('SELECT id,type,input_json FROM jobs WHERE owner_id=? AND idempotency_key=?').get(ownerId, idempotencyKey);
       if (prior) {
@@ -51,14 +60,20 @@ export async function createCompletedExport(db, { ownerId, workId, assetIds, wid
       throw Object.assign(new Error('本次导出文件总量超过 100 MB'), { status: 422, code: 'EXPORT_SIZE_LIMIT' });
     }
 
-    const now = Date.now(), jobId = randomUUID(), exportId = randomUUID();
-    const jobInput = { workId, assetIds, format: 'png', width, height, options: { ...options, clientRendered: true } };
+    const now = Date.now(), completedJobId = jobId || randomUUID(), exportId = randomUUID();
+    const jobInput = { workId, assetIds, format: 'png', width, height, options: { ...options, renderer: jobId ? 'sharp' : 'browser' } };
     const result = { exportId, assetIds, format: 'png', width, height, sliceCount: assetIds.length };
-    await tx.prepare(`INSERT INTO jobs(id,owner_id,type,status,progress,input_json,result_json,error_json,idempotency_key,previous_job_id,attempts,created_at,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(jobId, ownerId, 'export', 'succeeded', 100, JSON.stringify(jobInput), JSON.stringify(result), null, idempotencyKey, null, 0, now, now, now);
+    if (jobId) {
+      const updated = await tx.prepare(`UPDATE jobs SET status='succeeded',progress=100,input_json=?,result_json=?,error_json=NULL,finished_at=? WHERE id=? AND owner_id=? AND status='running'`)
+        .run(JSON.stringify(jobInput), JSON.stringify(result), now, jobId, ownerId);
+      if (updated.changes !== 1) throw Object.assign(new Error('导出任务状态已变化'), { status: 409, code: 'JOB_STATE_CONFLICT' });
+    } else {
+      await tx.prepare(`INSERT INTO jobs(id,owner_id,type,status,progress,input_json,result_json,error_json,idempotency_key,previous_job_id,attempts,created_at,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(completedJobId, ownerId, 'export', 'succeeded', 100, JSON.stringify(jobInput), JSON.stringify(result), null, idempotencyKey, null, 0, now, now, now);
+    }
     await tx.prepare('INSERT INTO exports(id,owner_id,work_id,job_id,format,width,height,slice_count,asset_ids_json,status,options_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(exportId, ownerId, workId, jobId, 'png', width, height, assetIds.length, JSON.stringify(assetIds), 'succeeded', JSON.stringify(jobInput.options), now);
-    outcome = { id: exportId, workId, jobId, format: 'png', width, height, sliceCount: assetIds.length, assetIds, status: 'succeeded', options: jobInput.options, createdAt: now };
+      .run(exportId, ownerId, workId, completedJobId, 'png', width, height, assetIds.length, JSON.stringify(assetIds), 'succeeded', JSON.stringify(jobInput.options), now);
+    outcome = { id: exportId, workId, jobId: completedJobId, format: 'png', width, height, sliceCount: assetIds.length, assetIds, status: 'succeeded', options: jobInput.options, createdAt: now };
   });
   return outcome;
 }

@@ -36,7 +36,7 @@ npm run db:import-sqlite
 
 导入脚本会先检查目标库所有业务表为空，避免覆盖；逐张验证源图片校验和后，在事务中迁入作品快照、角色、画格、版本历史、任务、会话和资源元数据，并把图片迁入当前配置的本地或 S3 存储。数据库事务失败时会清理本次新上传的对象。导入前请停掉应用并备份 SQLite 文件及图片目录。也可以通过 `SOURCE_DATABASE_PATH`、`SOURCE_ASSET_DIR` 指定来源路径。建议迁入后先在副本环境核对作品和图片，再切换正式服务。
 
-**当前部署边界：** PostgreSQL 已用于应用状态、作品/角色投影、资源元数据、会话和任务记录；图片可存本机持久化目录或 S3 兼容存储。任务仍在同一 Node 进程执行，因此目前适合单实例部署。多实例部署仍需 Redis/BullMQ 独立 worker。上线时需使用持久化存储、HTTPS 反向代理、数据库备份与恢复演练。
+**当前部署边界：** PostgreSQL 可用于应用状态、作品/角色投影、资源元数据、会话和任务记录；图片可存本机持久化目录或 S3 兼容存储。SQLite 本地模式由单进程处理任务；Compose 部署将 Web 与 BullMQ worker 分开。Docker/Redis 中断恢复和 S3 实例尚未在本机实测，上线前应完成相应联调、HTTPS 反向代理配置及数据库备份恢复演练。
 
 ### PostgreSQL 备份与恢复
 
@@ -65,17 +65,17 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 - 作品：新建（1–20 格）、搜索、过滤、复制、归档、回收站恢复和永久删除。
 - AI 流程：分镜 JSON 校验与一次修复、单格重绘版本、批量绘图、失败重试、取消和持久任务记录。
 - 编辑器：自动保存；保存冲突或断网时将草稿保留在浏览器并暂停自动覆盖，需明确选择载入服务器版或覆盖；格序拖放与快捷键、撤销/重做、画格比例/间距/背景、图片适配和焦点位置、版本对比。
-- 数据与导出：SQLite 开发存储或 PostgreSQL 部署存储、最多 50 个状态历史快照、JSON 作品备份导入/导出。导入会先校验版本、记录结构、ID、画布设置、资源地址和作品角色引用，整份校验通过后才合并；同 ID 记录覆盖前会提示。JSON 不包含图片二进制，跨环境迁移时需单独保留图片目录；PNG 长图当前由浏览器按格切片，完成后上传到资源存储并写入 PostgreSQL/SQLite 导出记录，可从导出对话框再次下载。上传/记录失败时仍可下载本地生成文件，但历史记录不会保存。
+- 数据与导出：SQLite 开发存储或 PostgreSQL 部署存储、最多 50 个状态历史快照、JSON 作品备份导入/导出。导入会先校验版本、记录结构、ID、画布设置、资源地址和作品角色引用，整份校验通过后才合并；同 ID 记录覆盖前会提示。JSON 不包含图片二进制，跨环境迁移时需单独保留图片目录；PNG 长图由后台 ExportService/worker 按固定作品快照合成、切片并保存到资源层，任务支持进度、取消和重试，可从导出对话框查看历史并再次下载。
 
 ## 可选单账号访问保护
 
 设置 `AUTH_PASSWORD` 后启用一个共享访问密码。会话使用 HttpOnly、SameSite Strict Cookie，写操作校验请求来源。公网部署必须使用 HTTPS 和强密码。当前不提供注册、多用户、云端同步或多人协作。
 
-静态服务只开放 `index.html` 和 `app.js`；`.env`、数据库、源码、迁移和依赖目录不会通过页面路由发布。内容安全策略禁止内联脚本。
+静态服务只开放 `index.html`、`app.js` 和共用漫画 SVG 组件 `comic-art.js`；`.env`、数据库、其他源码、迁移和依赖目录不会通过页面路由发布。内容安全策略禁止内联脚本。
 
 ## API
 
-前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`assets/export-slices`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。作品 `GET/POST /works/:id/exports` 提供持久化导出历史；导出切片上传仅允许 PNG、校验 owner/work 归属，元数据与成功任务在单一数据库事务中记录，并支持 `Idempotency-Key`。错误响应包含 `error.code`、`error.message` 和 `requestId`。
+前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`assets/export-slices`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。作品 `GET/POST /works/:id/exports` 提供导出历史；POST 默认创建后台导出任务，切片与任务完成记录在事务中保存，并支持 `Idempotency-Key`。错误响应包含 `error.code`、`error.message` 和 `requestId`。
 
 ## Docker Compose 部署
 
@@ -96,4 +96,4 @@ Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动
 
 ### 任务队列
 
-本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ；可通过 `SERVICE_ROLE=web` 和 `SERVICE_ROLE=worker` 将 Web 与 worker 分开，Docker Compose 已分别配置两个服务。Web 定时投递数据库中的 queued 任务，worker 使用数据库条件更新领取任务，避免同一任务被重复执行；worker 定时恢复超过 5 分钟租约的 running 任务。Web 在读取/修改作品状态前刷新快照，写入使用 revision 条件提交；worker 从数据库最新快照合并画格结果并在冲突时重试。取消状态由 worker 每秒轮询数据库，因此不依赖进程内共享内存。绘图任务会校验目标作品和画格归属；批量任务拒绝重复画格，并在数据库事务中一起检查 20 项容量上限和写入，避免超额或部分入队。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。当前主产品仍是单创作者；多实例 worker 仍需 Redis 环境做中断恢复集成验收。
+本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ；可通过 `SERVICE_ROLE=web` 和 `SERVICE_ROLE=worker` 将 Web 与 worker 分开，Docker Compose 已分别配置两个服务。Web 定时投递数据库中的 queued 任务，worker 使用数据库条件更新领取任务，避免同一任务被重复执行；worker 定时恢复超过 5 分钟租约的 running 任务。Web 在读取/修改作品状态前刷新快照，写入使用 revision 条件提交；worker 从数据库最新快照合并画格结果并在冲突时重试。取消状态由 worker 每秒轮询数据库，因此不依赖进程内共享内存。worker 负责分镜/绘图 provider 与 Sharp 长图合成；导出固定作品快照，完成后将 PNG 切片和成功任务记录写入数据库。批量绘图拒绝重复画格，并在数据库事务中一起检查 20 项容量上限和写入，避免超额或部分入队。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。真实 Redis 中断恢复仍需环境联调。
