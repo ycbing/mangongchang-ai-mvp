@@ -85,7 +85,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 
 ## API
 
-前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`assets/export-slices`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。作品 `GET/POST /works/:id/exports` 提供导出历史；POST 默认创建后台导出任务，切片与任务完成记录在事务中保存，并支持 `Idempotency-Key`。错误响应包含 `error.code`、`error.message` 和 `requestId`。`GET /healthz` 仅返回最小就绪状态供容器探针使用；详细 `GET /api/v1/health` 检查数据库、任务队列、资源存储和模型配置，并受账号鉴权保护。
+前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`assets/export-slices`、`jobs` 和图片资源路由。全量状态写入会校验作品/角色 ID 唯一性、1–20 格数量、角色引用、画布配置、画格版本、图片地址和文字布局，再执行 revision 冲突检测，避免结构损坏的数据覆盖有效快照；创建作品时也校验画格数、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。作品 `GET/POST /works/:id/exports` 提供导出历史；POST 默认创建后台导出任务，切片与任务完成记录在事务中保存，并支持 `Idempotency-Key`。错误响应包含 `error.code`、`error.message` 和 `requestId`。`GET /healthz` 仅返回最小就绪状态供容器探针使用；详细 `GET /api/v1/health` 检查数据库、任务队列、资源存储和模型配置，并受账号鉴权保护。
 
 ## Docker Compose 部署
 
