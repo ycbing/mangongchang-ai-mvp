@@ -40,6 +40,8 @@ npm run db:import-sqlite
 
 先在 `.env` 配置 `DATABASE_URL` 和 `LOCAL_STORAGE_DIR`，并确保安装了 PostgreSQL 客户端工具（`pg_dump`）。运行 `npm run backup:postgres` 会创建 `data/backups/mangongchang-<时间>/`，其中包含 PostgreSQL custom-format 数据库转储、本地图片压缩包和记录各文件 SHA-256/大小的 `manifest.json`；备份目录权限为仅当前用户可读写。可通过 `BACKUP_DIR` 指定另一个备份目录。为确保数据库和图片处于同一时点，建议先停止应用写入，再备份；备份应复制到独立、加密且定期演练恢复的存储位置。命令会拒绝在配置了 `S3_BUCKET` 时执行，以免产生“数据库已备份但图片对象未备份”的不完整副本；S3 图片须另行启用对象版本控制/复制或执行供应商侧备份。
 
+保留清理默认预览：`npm run backup:prune` 只识别含有效清单的产品备份目录，默认保留最新 14 个，并只考虑超过 90 天的更旧备份；其他文件夹、符号链接、缺失或不匹配的备份会跳过。确认逐项清单后执行 `npm run backup:prune -- --apply`。可用 `--keep=20` 和 `--retention-days=180` 调整数量与天数。清理前应确认异地备份可用；本工具不代替异地备份和恢复演练。
+
 恢复前先停止应用，并确认目标 PostgreSQL 数据库就是准备覆盖的库。通过 `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER` 和权限为 `0600` 的 `PGPASSFILE`（或 PostgreSQL service file）设置连接参数，然后运行 `pg_restore --clean --if-exists --no-owner --exit-on-error --dbname="$PGDATABASE" <备份目录>/database.dump` 恢复数据库，再将 `assets.tar.gz` 解压到配置的 `LOCAL_STORAGE_DIR`。恢复到空库后启动应用会自动应用缺失迁移；生产恢复应先在隔离环境演练，并按 `manifest.json` 核对文件 SHA-256。
 
 ## 模型配置
