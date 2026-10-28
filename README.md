@@ -94,4 +94,4 @@ Compose 会先等待 PostgreSQL 和 Redis 健康，再启动应用并自动执�
 
 ### 任务队列
 
-本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ，应用会把数据库中的排队任务按任务 ID 投递到 Redis；worker 使用数据库条件更新领取任务，避免同一任务被重复执行。Redis 连接中断时，数据库里的 queued 任务会由后台定时器重新投递。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。当前 worker 仍随应用进程启动，正式横向扩容前还需完成多实例状态同步和独立 worker 部署。
+本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ，应用会把数据库中的排队任务按任务 ID 投递到 Redis；worker 使用数据库条件更新领取任务，避免同一任务被重复执行。Redis 连接中断时，数据库里的 queued 任务会由后台定时器重新投递。绘图任务会校验目标作品和画格归属；批量任务拒绝重复画格，并在数据库事务中一起检查 20 项容量上限和写入，避免超额或部分入队。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。当前 worker 仍随应用进程启动，正式横向扩容前还需完成多实例状态同步和独立 worker 部署。
