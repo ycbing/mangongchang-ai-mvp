@@ -2,6 +2,7 @@ import sharp from 'sharp';
 import './comic-art.js';
 
 const MAX_OUTPUT_BYTES = 100_000_000;
+const MAX_OUTPUT_PIXELS = 32_000_000;
 
 function clamp(value, min, max, fallback) {
   const number = Number(value);
@@ -19,7 +20,7 @@ export function normalizeExportOptions(options = {}) {
     throw Object.assign(new Error('导出宽度、高度或格间距无效'), { code: 'INVALID_EXPORT_OPTIONS' });
   }
   const ratio = Array.isArray(options.ratio) ? options.ratio.map(Number) : String(options.ratio || '4/5').split('/').map(Number);
-  if (ratio.length !== 2 || ratio.some(value => !Number.isInteger(value) || value < 1 || value > 5)) {
+  if (ratio.length !== 2 || ![[4, 5], [3, 4], [1, 1]].some(supported => supported[0] === ratio[0] && supported[1] === ratio[1])) {
     throw Object.assign(new Error('导出画幅比例无效'), { code: 'INVALID_EXPORT_OPTIONS' });
   }
   const background = /^#[0-9a-f]{6}$/i.test(options.background || '') ? options.background : '#f6f4ed';
@@ -110,6 +111,8 @@ export async function renderComicExports({ work, options, loadImage, signal, onP
     group.push({ panel: work.panels[index], index }); groupHeight += nextHeight;
   }
   if (group.length) groups.push(group);
+  const totalPixels = groups.reduce((sum, entries) => sum + normalized.width * (normalized.gutter + entries.length * (panelHeight + normalized.gutter)), 0);
+  if (totalPixels > MAX_OUTPUT_PIXELS) throw Object.assign(new Error('长图总像素超过安全上限，请减少画格或降低导出宽度'), { code: 'EXPORT_PIXEL_LIMIT' });
 
   const slices = []; let outputBytes = 0, panelStart = 0;
   for (const entries of groups) {

@@ -32,4 +32,5 @@ test('server export handles generated panel assets and rejects unsupported outpu
   assert.equal(result.slices[0].width, 750);
   assert.equal((await sharp(result.slices[0].buffer).metadata()).height, 750);
   assert.throws(() => normalizeExportOptions({ width: 700, maxHeight: 8000, gutter: 16, ratio: '4/5' }), { code: 'INVALID_EXPORT_OPTIONS' });
+  assert.throws(() => normalizeExportOptions({ width: 900, maxHeight: 8000, gutter: 16, ratio: '1/5' }), { code: 'INVALID_EXPORT_OPTIONS' });
 });
