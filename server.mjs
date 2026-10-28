@@ -12,10 +12,9 @@ import { createCompletedExport, listWorkExports } from './export-store.mjs';
 import { normalizeExportOptions, renderComicExports } from './export-renderer.mjs';
 import { boundedInteger } from './runtime-config.mjs';
 import { verifyImage } from './image-validation.mjs';
+import { safeImageFetch } from './safe-image-fetch.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isIP } from 'node:net';
-import { lookup } from 'node:dns/promises';
 
 const root = resolve(fileURLToPath(new URL('.', import.meta.url)));
 // Read .env before evaluating configuration; shell-provided values always win.
@@ -212,8 +211,6 @@ async function saveImageAsset(bytes,contentType,metadata={}){
   catch(error){await assetStorage.delete(name).catch(()=>{});throw error;}
   return {assetId:id,imageUrl:`/assets/${name}`,mimeType:mime,sizeBytes:buffer.byteLength,...dimensions};
 }
-function privateAddress(address){if(isIP(address)===4){const a=address.split('.').map(Number);return a[0]===10||a[0]===127||a[0]===0||a[0]===169&&a[1]===254||a[0]===172&&a[1]>=16&&a[1]<=31||a[0]===192&&a[1]===168||a[0]>=224;}if(isIP(address)===6){const x=address.toLowerCase();return x==='::1'||x==='::'||x.startsWith('fc')||x.startsWith('fd')||x.startsWith('fe80')||x.startsWith('::ffff:127.');}return true;}
-async function safeImageFetch(value,signal){let url;try{url=new URL(value);}catch{throw new Error('绘图模型返回的图片地址无效');}for(let redirects=0;redirects<=4;redirects++){if(url.protocol!=='https:'||url.username||url.password)throw new Error('绘图模型图片地址必须使用 HTTPS');if(url.hostname==='localhost'||url.hostname.endsWith('.localhost'))throw new Error('绘图模型图片地址无效');const addresses=await lookup(url.hostname,{all:true}).catch(()=>[]);if(!addresses.length||addresses.some(x=>privateAddress(x.address)))throw new Error('绘图模型图片地址无法安全访问');const response=await fetch(url,{signal,redirect:'manual'});if(response.status>=300&&response.status<400){if(redirects===4)throw new Error('图片下载重定向次数过多');const location=response.headers.get('location');if(!location)throw new Error('图片地址重定向无效');url=new URL(location,url);continue;}return response;}throw new Error('图片下载失败');}
 async function callImageProvider(input,signal){
   if(!configured('panel_image'))return {mode:'mock'};
   const response=await fetch(endpoint(providerConfig.imageBaseUrl,'images/generations'),{method:'POST',signal,headers:{authorization:`Bearer ${providerConfig.imageApiKey}`,'content-type':'application/json'},body:JSON.stringify({model:providerConfig.imageModel,prompt:readText(input.prompt,5000),n:1,size:providerConfig.imageSize})});
@@ -224,8 +221,8 @@ async function callImageProvider(input,signal){
     const bytes=Buffer.from(image.b64_json,'base64');return {mode:'ai',...await saveImageAsset(bytes,'image/png',{workId:input.workId,panelId:input.panelId,kind:'panel_image'})};
   }
   if(typeof image?.url!=='string')throw new Error('绘图模型没有返回图片');
-  const imageResponse=await safeImageFetch(image.url,signal);if(!imageResponse.ok)throw new Error('无法下载绘图模型生成的图片');
-  const bytes=await readLimitedBody(imageResponse,maxImageBytes*1.5);return {mode:'ai',...await saveImageAsset(bytes,imageResponse.headers.get('content-type')||'',{workId:input.workId,panelId:input.panelId,kind:'panel_image'})};
+  const imageResponse=await safeImageFetch(image.url,signal,maxImageBytes*1.5);if(!imageResponse.ok)throw new Error(`无法下载绘图模型生成的图片（HTTP ${imageResponse.status}）`);
+  return {mode:'ai',...await saveImageAsset(imageResponse.bytes,imageResponse.contentType,{workId:input.workId,panelId:input.panelId,kind:'panel_image'})};
 }
 async function callExportRenderer(input,signal,job){
   const row=input.workSnapshot?null:await db.prepare('SELECT snapshot FROM app_state WHERE id=1').get(),snapshot=input.workSnapshot?null:row?JSON.parse(row.snapshot):null,work=input.workSnapshot?.id===input.workId?input.workSnapshot:snapshot?.works?.find(item=>item.id===input.workId&&!item.deletedAt);
