@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 
 function validKey(key) {
@@ -17,6 +18,7 @@ export async function openAssetStorage({ directory, s3Sdk: suppliedS3Sdk } = {})
       kind: 'local',
       async put(key, bytes) { const target = resolve(root, validKey(key)); if (!target.startsWith(root + sep)) throw new Error('资源路径无效'); await writeFile(target, bytes, { flag: 'wx' }); },
       async get(key, maxBytes = Infinity) { const bytes = await readFile(join(root, validKey(key))); if (bytes.byteLength > maxBytes) throw new Error('资源文件超过读取限制'); return bytes; },
+      async health() { try { await access(root, constants.R_OK | constants.W_OK); return true; } catch { return false; } },
       async inspect(key) { try { const bytes = await readFile(join(root, validKey(key))); return { exists: true, checksum: createHash('sha256').update(bytes).digest('hex') }; } catch (error) { if (error.code === 'ENOENT') return { exists: false, checksum: null }; throw error; } },
       async delete(key) { try { await unlink(join(root, validKey(key))); } catch (error) { if (error.code !== 'ENOENT') throw error; } },
       async close() {},
@@ -37,6 +39,7 @@ export async function openAssetStorage({ directory, s3Sdk: suppliedS3Sdk } = {})
   await client.send(new HeadBucketCommand({ Bucket: bucket }));
   return {
     kind: 's3',
+    async health() { try { await client.send(new HeadBucketCommand({ Bucket: bucket })); return true; } catch { return false; } },
     async put(key, bytes, mimeType) {
       const value = validKey(key), checksum = createHash('sha256').update(bytes).digest('hex');
       await client.send(new PutObjectCommand({ Bucket: bucket, Key: value, Body: bytes, ContentType: mimeType, CacheControl: 'private, max-age=86400', Metadata: { sha256: checksum } }));

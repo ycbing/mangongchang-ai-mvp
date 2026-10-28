@@ -87,7 +87,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 docker compose up --build -d
 ```
 
-Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动执行数据库迁移；独立 worker 在 Web 健康后启动，消费 BullMQ 任务。`/api/v1/health` 会检查数据库和 Web 到 Redis 的连接，依赖不可用时返回 HTTP 503。可用 `docker compose ps` 查看 Web、worker 和依赖状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；Web 与 worker 都会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
+Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动执行数据库迁移；独立 worker 在 Web 健康后启动，消费 BullMQ 任务。`/api/v1/health` 会检查数据库、队列和图片存储，依赖不可用时返回 HTTP 503；本地存储检查目录读写权限，S3 检查 bucket 可达性。可用 `docker compose ps` 查看 Web、worker 和依赖状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；Web 与 worker 都会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
 
 ### S3 兼容图片存储
 

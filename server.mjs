@@ -352,12 +352,13 @@ const server=createServer(async(req,res)=>{
     const usesState=path==='/api/v1/state'||path==='/api/v1/works'||path.startsWith('/api/v1/works/')||path==='/api/v1/characters'||path.startsWith('/api/v1/characters/')||(path==='/api/v1/jobs'&&req.method==='POST');
     if(usesState){releaseStateOperation=await acquireStateOperation();await refreshStateCache();}
     if(req.method==='GET'&&path==='/api/v1/health'){
-      const [databaseOk,queueOk]=await Promise.all([
+      const [databaseOk,queueOk,assetsOk]=await Promise.all([
         db.prepare('SELECT 1 AS ok').get().then(()=>true).catch(()=>false),
         jobQueue.health(),
+        assetStorage.health(),
       ]);
-      const ready=databaseOk&&queueOk;
-      return send(res,ready?200:503,{status:ready?'ok':'degraded',checks:{database:databaseOk?'ok':'unavailable',queue:queueOk?'ok':'unavailable'},storage:db.kind,assets:assetStorage.kind,queue:jobQueue.kind,revision,...safeConfig()});
+      const ready=databaseOk&&queueOk&&assetsOk;
+      return send(res,ready?200:503,{status:ready?'ok':'degraded',checks:{database:databaseOk?'ok':'unavailable',queue:queueOk?'ok':'unavailable',assetStorage:assetsOk?'ok':'unavailable'},storage:db.kind,assets:assetStorage.kind,queue:jobQueue.kind,revision,...safeConfig()});
     }
     if(req.method==='GET'&&path==='/api/v1/config')return send(res,200,safeConfig());
     if(path==='/api/v1/state'&&req.method==='GET')return send(res,200,{state,revision});
