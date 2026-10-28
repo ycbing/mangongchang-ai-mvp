@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
+    "test": "node --test",
     "db:migrate": "node scripts/migrate-db.mjs",
     "db:import-sqlite": "node scripts/import-sqlite.mjs",
     "assets:gc": "node scripts/gc-assets.mjs",

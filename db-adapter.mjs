@@ -42,7 +42,7 @@ export async function openDatabase({ databaseUrl, databasePath }) {
   await mkdir(dirname(resolve(databasePath)), { recursive: true });
   const sqlite = new DatabaseSync(databasePath);
   let queue = Promise.resolve();
-  async function locked(fn) { const previous = queue; let release; queue = new Promise(resolve => { release = resolve; }); await previous; try { return fn(); } finally { release(); } }
+  async function locked(fn) { const previous = queue; let release; queue = new Promise(resolve => { release = resolve; }); await previous; try { return await fn(); } finally { release(); } }
   return {
     kind: 'sqlite',
     prepare(sql) {

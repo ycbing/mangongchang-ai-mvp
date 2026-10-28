@@ -13,6 +13,8 @@ npm start
 
 打开 `http://localhost:4173`。默认数据库为 `data/mangongchang.sqlite`，图片位于 `data/assets/`。首次启动会建立数据库；旧版 `data/state.json` 会自动导入。`data/` 已加入忽略列表，请自行定期备份。
 
+运行内置回归检查：`npm test`。当前覆盖画布/角色输入校验，以及 SQLite 与队列容量有关的并发事务边界。
+
 ## PostgreSQL 部署
 
 配置 PostgreSQL 连接串并设置单账号访问密码：

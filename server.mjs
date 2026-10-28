@@ -5,6 +5,8 @@ import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypt
 import { openDatabase, applyPostgresMigrations } from './db-adapter.mjs';
 import { openAssetStorage } from './asset-storage.mjs';
 import { createJobQueue } from './job-queue.mjs';
+import { insertJobsWithinLimit } from './job-admission.mjs';
+import { validateCanvasSettings, validateCharacterInput } from './validation.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
@@ -158,15 +160,6 @@ function rowToJob(row) {
 }
 const jobSelect=db.prepare('SELECT * FROM jobs WHERE id=? AND owner_id=?');
 async function getJob(id){const row=await jobSelect.get(id,ownerId);return row?rowToJob(row):null;}
-async function insertJobsWithinLimit(jobs){
-  await db.transaction(async tx=>{
-    if(db.kind==='postgres')await tx.prepare('SELECT pg_advisory_xact_lock(73210001)').get();
-    const active=Number((await tx.prepare("SELECT count(*) n FROM jobs WHERE owner_id=? AND status IN ('queued','running','cancel_requested')").get(ownerId)).n);
-    if(active+jobs.length>20)throw Object.assign(new Error(`当前待处理任务为 ${active} 个；本次 ${jobs.length} 个任务会超过 20 个上限`),{status:429,code:'QUEUE_LIMIT'});
-    const insert=tx.prepare('INSERT INTO jobs(id,owner_id,type,status,progress,input_json,idempotency_key,previous_job_id,attempts,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)');
-    for(const job of jobs)await insert.run(job.id,ownerId,job.type,job.status,0,JSON.stringify(job.input),job.idempotencyKey||null,job.previousJobId||null,job.attempts||0,job.createdAt);
-  });
-}
 async function saveJob(job){await db.prepare(`UPDATE jobs SET status=?,progress=?,input_json=?,result_json=?,error_json=?,attempts=?,started_at=?,finished_at=? WHERE id=? AND owner_id=?`).run(job.status,job.progress,JSON.stringify(job.input),job.result?JSON.stringify(job.result):null,job.error?JSON.stringify(job.error):null,job.attempts||0,job.startedAt||null,job.finishedAt||null,job.id,ownerId);}
 function configured(kind) {
   if (kind==='storyboard') return providerConfig.llmProvider!=='mock'&&providerConfig.llmBaseUrl&&providerConfig.llmApiKey&&providerConfig.llmModel;
@@ -176,8 +169,6 @@ function configured(kind) {
 function validProviderUrl(value){const url=new URL(value);if(!['https:','http:'].includes(url.protocol))throw new Error('模型服务地址必须使用 HTTP 或 HTTPS');return url.toString().replace(/\/$/,'');}
 function endpoint(base,path){return `${validProviderUrl(base)}/${path}`;}
 function readText(value,max=1200){return typeof value==='string'?value.trim().slice(0,max):'';}
-function validateCanvasSettings(value,fallback={ratio:'4/5',gutter:16,bg:'#f6f4ed'}){if(value===undefined)return fallback;if(!value||typeof value!=='object'||Array.isArray(value)||!['4/5','3/4','1/1'].includes(value.ratio)||!Number.isInteger(value.gutter)||value.gutter<8||value.gutter>32||typeof value.bg!=='string'||!/^#[0-9a-f]{6}$/i.test(value.bg))throw Object.assign(new Error('画布设置无效：请选择支持的比例、8–32 px 间距和十六进制背景色'),{status:422,code:'VALIDATION_ERROR'});return {ratio:value.ratio,gutter:value.gutter,bg:value.bg.toLowerCase()};}
-function validateCharacterInput(input,{partial=false}={}){if(!input||typeof input!=='object'||Array.isArray(input))throw Object.assign(new Error('角色数据无效'),{status:422,code:'VALIDATION_ERROR'});const fields={};for(const [key,max] of [['name',120],['summary',500],['look',2000],['style',1000]]){const source=key==='look'&&input.look===undefined?input.description:input[key];if(source===undefined){if(!partial&&key==='name')throw Object.assign(new Error('角色名称不能为空'),{status:422,code:'VALIDATION_ERROR'});continue;}if(typeof source!=='string'||source.trim().length>max||(key==='name'&&!source.trim()))throw Object.assign(new Error(key==='name'?'角色名称无效':`角色${key}字段无效`),{status:422,code:'VALIDATION_ERROR'});fields[key]=source.trim();}if(input.tags!==undefined){if(!Array.isArray(input.tags)||input.tags.length>30||input.tags.some(tag=>typeof tag!=='string'||tag.trim().length>50))throw Object.assign(new Error('角色标签无效'),{status:422,code:'VALIDATION_ERROR'});fields.tags=[...new Set(input.tags.map(tag=>tag.trim()).filter(Boolean))];}if(input.referenceAssetIds!==undefined){if(!Array.isArray(input.referenceAssetIds)||input.referenceAssetIds.length>10||input.referenceAssetIds.some(id=>typeof id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))||new Set(input.referenceAssetIds).size!==input.referenceAssetIds.length)throw Object.assign(new Error('角色参考资源列表无效'),{status:422,code:'VALIDATION_ERROR'});fields.referenceAssetIds=[...input.referenceAssetIds];}if(input.archivedAt!==undefined){if(input.archivedAt!==null&&!Number.isSafeInteger(input.archivedAt))throw Object.assign(new Error('角色归档时间无效'),{status:422,code:'VALIDATION_ERROR'});fields.archivedAt=input.archivedAt;}return fields;}
 function normalizePanel(panel,index){return {index,scene:readText(panel?.scene,800),action:readText(panel?.action,800),camera:readText(panel?.camera,240),expression:readText(panel?.expression,240),dialogue:readText(panel?.dialogue,700),caption:readText(panel?.caption,700),sfx:readText(panel?.sfx,180),imagePrompt:readText(panel?.imagePrompt,1800),negativePrompt:readText(panel?.negativePrompt,1000),tone:readText(panel?.tone,40)||'hope'};}
 async function readLimitedBody(response,limit){
   const declared=Number(response.headers.get('content-length')||0);
@@ -369,14 +360,14 @@ const server=createServer(async(req,res)=>{
           const ids=Array.isArray(input.panelIds)?input.panelIds:[];
           if(ids.length<1||ids.length>20||ids.some(id=>typeof id!=='string')||new Set(ids).size!==ids.length||ids.some(id=>!work.panels.some(panel=>panel.id===id)))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'批量绘图必须选择当前作品中 1–20 个不同画格'},requestId});
           const jobs=ids.map(panelId=>({id:randomUUID(),ownerId,type:'panel_image',status:'queued',progress:0,input:{workId:work.id,panelId,prompt:readText(input.prompts?.[panelId]||input.prompt,5000)},createdAt:Date.now(),attempts:0}));
-          await insertJobsWithinLimit(jobs);schedulePump();return send(res,202,{batchId:randomUUID(),items:jobs});
+          await insertJobsWithinLimit(db,ownerId,jobs);schedulePump();return send(res,202,{batchId:randomUUID(),items:jobs});
         }
         const jobInput={...input,workId:work.id,panelCount:input.panelCount||work.panels.length,premise:input.premise||work.premise,title:input.title||work.title};
         if(type==='panel_image'){
           if(!work.panels.some(panel=>panel.id===input.panelId))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'绘图任务必须引用当前作品中的有效画格'},requestId});
           jobInput.panelId=input.panelId;jobInput.prompt=readText(input.prompt,5000);
         }
-        const id=randomUUID(),job={id,ownerId,type,status:'queued',progress:0,input:jobInput,createdAt:Date.now(),attempts:0};await insertJobsWithinLimit([job]);schedulePump();return send(res,202,{jobId:id,status:'queued',pollUrl:`/api/v1/jobs/${id}`});
+        const id=randomUUID(),job={id,ownerId,type,status:'queued',progress:0,input:jobInput,createdAt:Date.now(),attempts:0};await insertJobsWithinLimit(db,ownerId,[job]);schedulePump();return send(res,202,{jobId:id,status:'queued',pollUrl:`/api/v1/jobs/${id}`});
       }
     }
     if(path==='/api/v1/characters'&&req.method==='POST'){
@@ -394,7 +385,7 @@ const server=createServer(async(req,res)=>{
         const ids=Array.isArray(input.panelIds)?input.panelIds:[];
         if(!targetWork||ids.length<1||ids.length>20||ids.some(id=>typeof id!=='string')||new Set(ids).size!==ids.length||ids.some(id=>!targetWork.panels.some(panel=>panel.id===id)))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'批量绘图必须选择当前作品中 1–20 个不同画格'},requestId});
         const created=ids.map(panelId=>({id:randomUUID(),ownerId,type:'panel_image',status:'queued',progress:0,input:{workId,panelId,prompt:readText(input.prompts?.[panelId]||input.prompt,5000)},createdAt:Date.now(),attempts:0}));
-        await insertJobsWithinLimit(created);
+          await insertJobsWithinLimit(db,ownerId,created);
         schedulePump();return send(res,202,{batchId:randomUUID(),items:created});
       }
       if(payload.type==='panel_image'){
@@ -402,10 +393,10 @@ const server=createServer(async(req,res)=>{
         if(!targetWork||!targetWork.panels.some(panel=>panel.id===input.panelId))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'绘图任务必须引用当前作品中的有效画格'},requestId});
         input={workId:targetWork.id,panelId:input.panelId,prompt:readText(input.prompt,5000)};
       }
-      const id=randomUUID(),job={id,ownerId,type:payload.type,status:'queued',progress:0,input,createdAt:Date.now(),attempts:0,idempotencyKey:idem||null,previousJobId:null};await insertJobsWithinLimit([job]);schedulePump();return send(res,202,job);
+      const id=randomUUID(),job={id,ownerId,type:payload.type,status:'queued',progress:0,input,createdAt:Date.now(),attempts:0,idempotencyKey:idem||null,previousJobId:null};await insertJobsWithinLimit(db,ownerId,[job]);schedulePump();return send(res,202,job);
     }
     const retryMatch=path.match(/^\/api\/v1\/jobs\/([^/]+)\/retry$/);
-    if(retryMatch&&req.method==='POST'){const prev=await getJob(retryMatch[1]);if(!prev)return send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});if(prev.status!=='failed'&&prev.status!=='cancelled')return send(res,409,{error:{code:'JOB_NOT_RETRYABLE',message:'只有失败或取消的任务可以重试'},requestId});const id=randomUUID(),job={...prev,id,status:'queued',progress:0,result:null,error:null,attempts:0,createdAt:Date.now(),startedAt:null,finishedAt:null,previousJobId:prev.id,idempotencyKey:null};await insertJobsWithinLimit([job]);schedulePump();return send(res,202,job);}
+    if(retryMatch&&req.method==='POST'){const prev=await getJob(retryMatch[1]);if(!prev)return send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});if(prev.status!=='failed'&&prev.status!=='cancelled')return send(res,409,{error:{code:'JOB_NOT_RETRYABLE',message:'只有失败或取消的任务可以重试'},requestId});const id=randomUUID(),job={...prev,id,status:'queued',progress:0,result:null,error:null,attempts:0,createdAt:Date.now(),startedAt:null,finishedAt:null,previousJobId:prev.id,idempotencyKey:null};await insertJobsWithinLimit(db,ownerId,[job]);schedulePump();return send(res,202,job);}
     const cancelMatch=path.match(/^\/api\/v1\/jobs\/([^/]+)\/cancel$/);
     if(cancelMatch&&req.method==='POST'){const job=await getJob(cancelMatch[1]);if(!job)return send(res,404,{error:{code:'NOT_FOUND',message:'任务不存在'},requestId});if(job.status==='queued'){job.status='cancelled';job.finishedAt=Date.now();await saveJob(job);}else if(job.status==='running'){job.status='cancel_requested';await saveJob(job);jobsById.get(job.id)?.controller?.abort();}return send(res,200,job);}
     if(path==='/api/v1/jobs'&&req.method==='GET'){const rows=await db.prepare('SELECT * FROM jobs WHERE owner_id=? ORDER BY created_at DESC LIMIT 100').all(ownerId);const workId=url.searchParams.get('workId');return send(res,200,{items:rows.map(rowToJob).filter(j=>!workId||j.input.workId===workId)});}
