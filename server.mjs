@@ -13,6 +13,7 @@ import { normalizeExportOptions, renderComicExports } from './export-renderer.mj
 import { boundedInteger } from './runtime-config.mjs';
 import { verifyImage } from './image-validation.mjs';
 import { safeImageFetch } from './safe-image-fetch.mjs';
+import { syncDatabaseProjection } from './projection-store.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -128,20 +129,7 @@ let state=JSON.parse(stateRow.snapshot);
 const stateRevisionBySnapshot=new WeakMap([[state,revision]]);
 let stateOperationQueue=Promise.resolve();
 await db.prepare('INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING').run(ownerId,null,null,Date.now());
-async function syncProjection(snapshot, tx = db) {
-  await tx.prepare('DELETE FROM panels').run(); await tx.prepare('DELETE FROM work_characters').run();
-  await tx.prepare('DELETE FROM works WHERE owner_id=?').run(ownerId); await tx.prepare('DELETE FROM characters WHERE owner_id=?').run(ownerId);
-  const putChar=tx.prepare('INSERT INTO characters(id,owner_id,name,summary,visual_profile_json,style_anchors_json,reference_asset_ids_json,tags_json,created_at,updated_at,archived_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
-  for(const c of snapshot.characters||[]) await putChar.run(c.id,ownerId,String(c.name||''),String(c.summary||''),JSON.stringify(c.visualProfile||{look:c.look||''}),JSON.stringify(c.styleAnchors||{style:c.style||''}),JSON.stringify(c.referenceAssetIds||[]),JSON.stringify(c.tags||[]),c.createdAt||c.updatedAt||Date.now(),c.updatedAt||Date.now(),c.archivedAt||null,c.deletedAt||null);
-  const putWork=tx.prepare('INSERT INTO works(id,owner_id,title,premise,status,settings_json,character_snapshot_json,created_at,updated_at,archived_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)');
-  const putLink=tx.prepare('INSERT INTO work_characters(work_id,character_id,snapshot_json) VALUES(?,?,?)');
-  const putPanel=tx.prepare('INSERT INTO panels(id,work_id,order_index,storyboard_json,layout_json,current_image_asset_id,generation_status,updated_at) VALUES(?,?,?,?,?,?,?,?)');
-  for(const w of snapshot.works||[]) {
-    await putWork.run(w.id,ownerId,String(w.title||''),String(w.premise||''),w.status||'editing',JSON.stringify(w.settings||{}),JSON.stringify(w.characterSnapshot||null),w.createdAt||w.updatedAt||Date.now(),w.updatedAt||Date.now(),w.archivedAt||null,w.deletedAt||null);
-    if(w.characterId) await putLink.run(w.id,w.characterId,JSON.stringify(w.characterSnapshot||{}));
-    for(let i=0;i<(w.panels||[]).length;i++) { const p=w.panels[i], current=p.imageVersions?.find(v=>v.version===p.version); await putPanel.run(p.id,w.id,i,JSON.stringify({scene:p.scene||'',action:p.action||'',camera:p.camera||'',expression:p.expression||'',dialogue:p.dialogue||'',caption:p.caption||'',sfx:p.sfx||'',imagePrompt:p.imagePrompt||'',negativePrompt:p.negativePrompt||'',tone:p.tone||''}),JSON.stringify({ratio:w.settings?.ratio||'4/5',fit:p.fit||'cover',focalPoint:p.focalPoint||{x:.5,y:.5},dialogueLayout:p.dialogueLayout||null,captionLayout:p.captionLayout||null,elements:p.elements||[]}),current?.assetId||null,p.generationStatus||'draft',w.updatedAt||Date.now()); }
-  }
-}
+async function syncProjection(snapshot, tx = db) { return syncDatabaseProjection(tx, snapshot, ownerId); }
   if(freshState&&serviceRole!=='worker')await db.transaction(tx=>syncProjection(state,tx));
 async function saveState(next, expectedRevision) {
   const explicitlyVersioned=expectedRevision!==undefined,compareRevision=explicitlyVersioned?Number(expectedRevision):(stateRevisionBySnapshot.get(next)??revision);let outcome;

@@ -25,7 +25,7 @@ AUTH_PASSWORD=替换为高强度随机密码
 LOCAL_STORAGE_DIR=/持久化磁盘/mangongchang-assets
 ```
 
-`DATABASE_URL` 非空时应用启动前会检查 PostgreSQL 连接并应用版本化迁移（`migrations/`）。迁移文件按三位或更多数字前缀排序，例如 `002_add_export_metadata.sql`；已经应用的迁移不要修改，新增变更请添加更高版本文件。应用启动和 `npm run db:migrate` 共用 PostgreSQL advisory lock，多个进程并发启动时会串行检查并应用迁移。迁移 SQL 会记录 SHA-256 校验值，后续启动会拒绝已应用文件被静默修改。连接池默认为 10，可用 `PG_POOL_MAX` 调整。容器部署可设置 `HOST=0.0.0.0` 并放在 HTTPS 反向代理后；本机默认仅监听回环地址。没有 `DATABASE_URL` 时继续使用 SQLite。若设置 `REDIS_URL`，任务会通过 BullMQ 投递到 Redis；数据库中的任务记录是恢复与轮询依据，应用会定时重新投递仍处于排队状态的任务。
+`DATABASE_URL` 非空时应用启动前会检查 PostgreSQL 连接并应用版本化迁移（`migrations/`）。迁移文件按三位或更多数字前缀排序，例如 `002_add_export_metadata.sql`；已经应用的迁移不要修改，新增变更请添加更高版本文件。应用启动和 `npm run db:migrate` 共用 PostgreSQL advisory lock，多个进程并发启动时会串行检查并应用迁移。迁移 SQL 会记录 SHA-256 校验值，后续启动会拒绝已应用文件被静默修改。连接池默认为 10，可用 `PG_POOL_MAX` 调整。作品快照写入事务会同步维护关系投影；作品、角色与画格按 ID 增量 upsert/删除，只有投影字段变化时才更新现有行；改动单个作品不会清空重建整个 owner 的投影，画格换序会在事务内避开唯一序号冲突。容器部署可设置 `HOST=0.0.0.0` 并放在 HTTPS 反向代理后；本机默认仅监听回环地址。没有 `DATABASE_URL` 时继续使用 SQLite。若设置 `REDIS_URL`，任务会通过 BullMQ 投递到 Redis；数据库中的任务记录是恢复与轮询依据，应用会定时重新投递仍处于排队状态的任务。
 
 关键整数运行参数会在启动时严格校验，非法值不会静默绕过限制：`PORT` 范围为 1–65535；`MAX_REQUEST_MB` 为 1–200；`MAX_IMAGE_UPLOAD_MB` 为 1–100；`AUTH_SESSION_DAYS` 为 1–30；`JOB_CONCURRENCY` 为 1–8；`PG_POOL_MAX` 为 1–100。未设置时使用 `.env.example` 中的默认值。PNG/JPEG/WebP 资源均在写入前解码校验，最大 24 MP 且不接受动画帧；图片文件大小仍受 `MAX_IMAGE_UPLOAD_MB` 限制。
 
