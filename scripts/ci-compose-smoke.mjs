@@ -22,15 +22,29 @@ if (!healthResponse.ok) throw new Error(`Authenticated health check failed: HTTP
 const health = await healthResponse.json();
 if (health.storage !== 'postgres' || health.queue !== 'bullmq' || health.status !== 'ok') throw new Error(`Compose dependencies are not ready: ${JSON.stringify(health)}`);
 
-const created = await fetch(`${baseUrl}/api/v1/jobs`, {
+console.log('Compose smoke: production authentication and PostgreSQL/BullMQ health passed.');
+
+// Exercise the same work -> storyboard flow used by the product UI. This also
+// verifies that work state and its queued job are visible across app processes.
+const workResponse = await fetch(`${baseUrl}/api/v1/works`, {
   method: 'POST',
   headers: { cookie, origin: baseUrl, 'content-type': 'application/json' },
-  body: JSON.stringify({ type: 'storyboard', input: { title: 'CI 队列验收', premise: '跨进程任务端到端冒烟', panelCount: 2 } }),
+  body: JSON.stringify({ title: 'CI 队列验收', premise: '跨进程任务端到端冒烟', panelCount: 2 }),
 });
-if (created.status !== 202) throw new Error(`Could not enqueue a worker job: HTTP ${created.status} ${await created.text()}`);
+if (workResponse.status !== 201) throw new Error(`Could not create a smoke-test work: HTTP ${workResponse.status} ${await workResponse.text()}`);
+const { work } = await workResponse.json();
+if (!work?.id) throw new Error('Work API did not return a work ID.');
+
+const created = await fetch(`${baseUrl}/api/v1/works/${encodeURIComponent(work.id)}/storyboards`, {
+  method: 'POST',
+  headers: { cookie, origin: baseUrl, 'content-type': 'application/json' },
+  body: JSON.stringify({}),
+});
+if (created.status !== 202) throw new Error(`Could not enqueue a storyboard job: HTTP ${created.status} ${await created.text()}`);
 const createdJob = await created.json();
 const jobId = createdJob.jobId || createdJob.id;
-if (!jobId) throw new Error('Job API did not return a job ID.');
+if (!jobId) throw new Error(`Storyboard API did not return a job ID: ${JSON.stringify(createdJob)}`);
+console.log(`Compose smoke: created work ${work.id} and queued storyboard job ${jobId}.`);
 
 let job;
 const deadline = Date.now() + 30_000;
@@ -42,4 +56,4 @@ while (Date.now() < deadline) {
   await new Promise(resolve => setTimeout(resolve, 250));
 }
 if (job?.status !== 'succeeded' || job.result?.mode !== 'mock') throw new Error(`Cross-container worker job did not succeed: ${JSON.stringify(job)}`);
-console.log(`Compose smoke passed: PostgreSQL, BullMQ worker, production auth, and job ${jobId}.`);
+console.log(`Compose smoke passed: PostgreSQL, BullMQ worker, production auth, and storyboard job ${jobId}.`);
