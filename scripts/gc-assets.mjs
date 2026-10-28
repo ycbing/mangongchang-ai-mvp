@@ -44,18 +44,26 @@ try {
   if (!snapshotRow) throw new Error('找不到作品状态快照；已停止清理。');
   const references = collectReferences(JSON.parse(snapshotRow.snapshot));
   const cutoff = Date.now() - graceDays * 86400_000;
-  const candidates = (await db.prepare('SELECT id,storage_key,size_bytes FROM assets WHERE owner_id=? AND created_at<? ORDER BY created_at').all(ownerId, cutoff))
+  const candidates = (await db.prepare('SELECT id,storage_key,size_bytes,created_at FROM assets WHERE owner_id=? AND created_at<? ORDER BY created_at').all(ownerId, cutoff))
     .filter(row => !references.ids.has(row.id) && !references.keys.has(row.storage_key));
   const totalBytes = candidates.reduce((sum, row) => sum + Number(row.size_bytes || 0), 0);
   console.log(`${apply ? '清理模式' : '预览模式'}：${graceDays} 天前的未引用资源 ${candidates.length} 个，共 ${(totalBytes / 1_000_000).toFixed(2)} MB。`);
+  if (candidates.length) {
+    console.log('资源清单（存储键 | 资源 ID | 大小 | 已保存天数）：');
+    for (const asset of candidates) {
+      const ageDays = Math.max(0, Math.floor((Date.now() - Number(asset.created_at)) / 86400_000));
+      console.log(`${asset.storage_key} | ${asset.id} | ${Number(asset.size_bytes || 0)} B | ${ageDays} 天`);
+    }
+  }
   if (!apply) {
-    console.log('未删除任何文件。检查结果后，使用 npm run assets:gc -- --apply 执行清理。');
+    console.log('未删除任何文件。检查上方清单并备份后，使用 npm run assets:gc -- --apply 执行清理。');
   } else {
     let deleted = 0;
     for (const asset of candidates) {
       await storage.delete(asset.storage_key);
       await db.prepare('DELETE FROM assets WHERE id=? AND owner_id=?').run(asset.id, ownerId);
       deleted++;
+      console.log(`已删除：${asset.storage_key} (${asset.id})`);
     }
     console.log(`已删除 ${deleted} 个未引用资源。`);
   }
