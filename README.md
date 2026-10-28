@@ -107,3 +107,7 @@ Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动
 ### 任务队列
 
 本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ；可通过 `SERVICE_ROLE=web` 和 `SERVICE_ROLE=worker` 将 Web 与 worker 分开，Docker Compose 已分别配置两个服务。Web 定时投递数据库中的 queued 任务，worker 使用数据库条件更新领取任务，避免同一任务被重复执行；worker 每 15 秒更新数据库心跳，恢复器按最近心跳判断 5 分钟失联租约，旧的无心跳 running 任务回退到 started_at 兼容恢复。Web 在读取/修改作品状态前刷新快照，写入使用 revision 条件提交；worker 从数据库最新快照合并画格结果并在冲突时重试。取消状态由 worker 每秒轮询数据库，因此不依赖进程内共享内存。worker 负责分镜/绘图 provider 与 Sharp 长图合成；导出固定作品快照，完成后将 PNG 切片和成功任务记录写入数据库。批量绘图拒绝重复画格，并在数据库事务中一起检查 20 项容量上限和写入，避免超额或部分入队。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。真实 Redis 中断恢复仍需环境联调。
+
+## 持续集成
+
+GitHub Actions 在每次推送到 `main` 和拉取请求时运行 Node 测试，并提供真实 PostgreSQL、Redis 服务覆盖数据库并发竞态和 BullMQ 跨进程投递；独立 Compose 冒烟任务构建生产镜像，检查鉴权、PostgreSQL/Redis 健康状态及 Web 到 worker 的 mock 分镜任务闭环。该工作流成功记录需以仓库 Actions 实际运行结果为准。

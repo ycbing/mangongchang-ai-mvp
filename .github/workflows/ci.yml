@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Node tests with PostgreSQL and Redis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run unit and PostgreSQL/Redis integration tests
+        run: npm test
+        env:
+          PG_RACE_TEST_URL: postgresql://postgres:ci-postgres-password@127.0.0.1:5432/postgres
+          REDIS_TEST_URL: redis://127.0.0.1:6379/1
+
+  compose-smoke:
+    name: Docker Compose production smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Configure disposable Compose credentials
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=ci-postgres-password
+          REDIS_PASSWORD=ci-redis-password
+          AUTH_PASSWORD=ci-compose-auth-password-with-enough-length
+          EOF
+      - name: Build and start production services
+        run: docker compose up --build --detach --wait --wait-timeout 300
+      - name: Verify authenticated PostgreSQL and cross-container BullMQ workflow
+        run: node scripts/ci-compose-smoke.mjs
+        env:
+          CI_AUTH_PASSWORD: ci-compose-auth-password-with-enough-length
+      - name: Show service diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color
+      - name: Stop services and remove disposable volumes
+        if: always()
+        run: docker compose down --volumes --remove-orphans

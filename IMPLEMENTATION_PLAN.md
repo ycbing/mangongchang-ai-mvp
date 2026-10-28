@@ -86,7 +86,8 @@
 - [x] 使用真实临时 PostgreSQL 实例验证 Web/worker 并发状态变更都保留、revision 单调递增、过期 revision 被拒绝。
 - [x] 增加持久化任务心跳；恢复器按最近心跳回收失联运行任务，兼容旧的无心跳记录，并仅在取消任务心跳过期后收敛为 cancelled；SQLite HTTP 长图闭环与真实 PostgreSQL migration 003/任务恢复均已验证。
 - [x] 服务收到 SIGTERM/SIGINT 后停止接收新请求、关闭空闲连接并清理队列、数据库和资源客户端；带 PostgreSQL 的 API 集成测试验证服务能正常退出。
-- [ ] 在真实 Redis/Docker 环境验证 BullMQ 中断恢复、worker 租约恢复与 Compose 多服务启动。
+- [x] 增加 GitHub Actions 持续集成：Node 测试运行真实 PostgreSQL/Redis 服务，Compose job 检查生产鉴权、依赖健康及跨容器 worker 任务；首轮远端 workflow 结果待确认。
+- [ ] 在真实 Redis/Docker 环境验证 BullMQ 中断恢复、worker 租约恢复与 Compose 多服务启动；GitHub Actions 已加入 PostgreSQL/Redis 服务测试和 Compose 跨容器任务冒烟，仍需首轮线上 workflow 结果及中断恢复专项验收。本机暂缺 Docker/Redis 服务。
 
 ### 8. PostgreSQL 备份与恢复
 - [x] 增加 PostgreSQL custom-format 备份命令，并将本地图片目录打包到同一备份目录。
