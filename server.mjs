@@ -11,6 +11,7 @@ import { mutateSnapshot, persistSnapshot } from './state-store.mjs';
 import { createCompletedExport, listWorkExports } from './export-store.mjs';
 import { normalizeExportOptions, renderComicExports } from './export-renderer.mjs';
 import { boundedInteger } from './runtime-config.mjs';
+import { verifyImage } from './image-validation.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
@@ -203,10 +204,9 @@ async function callStoryboard(input,signal){
   }
 }
 function imageExtension(contentType){const type=String(contentType).split(';')[0].trim().toLowerCase();if(type==='image/png')return ['.png',type];if(type==='image/jpeg'||type==='image/jpg')return ['.jpg','image/jpeg'];if(type==='image/webp')return ['.webp',type];throw new Error('图片格式不受支持（请使用 PNG、JPEG 或 WebP）');}
-function verifyImage(bytes,mime){const b=Buffer.from(bytes);const png=b.length>24&&b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));const jpeg=b.length>3&&b[0]===255&&b[1]===216&&b[2]===255;const webp=b.length>12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WEBP';if(!((mime==='image/png'&&png)||(mime==='image/jpeg'&&jpeg)||(mime==='image/webp'&&webp)))throw new Error('图片文件内容与类型不一致');if(png){const w=b.readUInt32BE(16),h=b.readUInt32BE(20);if(w>10000||h>10000||w*h>60_000_000)throw new Error('图片尺寸超出限制');return {width:w,height:h};}return {width:null,height:null};}
 async function saveImageAsset(bytes,contentType,metadata={}){
   if(bytes.byteLength>maxImageBytes*1.5)throw new Error('生成图片超过大小限制');
-  const [suffix,mime]=imageExtension(contentType),dimensions=verifyImage(bytes,mime),name=`${randomUUID()}${suffix}`,id=randomUUID(),buffer=Buffer.from(bytes),checksum=createHash('sha256').update(buffer).digest('hex');
+  const [suffix,mime]=imageExtension(contentType),dimensions=await verifyImage(bytes,mime),name=`${randomUUID()}${suffix}`,id=randomUUID(),buffer=Buffer.from(bytes),checksum=createHash('sha256').update(buffer).digest('hex');
   await assetStorage.put(name,buffer,mime);
   try { await db.prepare('INSERT INTO assets(id,owner_id,work_id,panel_id,kind,storage_key,mime_type,width,height,size_bytes,checksum,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,ownerId,metadata.workId||null,metadata.panelId||null,metadata.kind||'panel_image',name,mime,dimensions.width,dimensions.height,buffer.byteLength,checksum,JSON.stringify(metadata),Date.now()); }
   catch(error){await assetStorage.delete(name).catch(()=>{});throw error;}

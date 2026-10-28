@@ -68,11 +68,11 @@ function textOverlay(panel, width, height) {
 }
 
 async function imagePanel(bytes, panel, width, height, background) {
-  const oriented = await sharp(bytes, { limitInputPixels: 60_000_000, failOn: 'warning' }).rotate().toBuffer();
-  const metadata = await sharp(oriented, { limitInputPixels: 60_000_000, failOn: 'warning' }).metadata();
-  if (!metadata.width || !metadata.height || metadata.width * metadata.height > 60_000_000) throw Object.assign(new Error('画格图片尺寸无效或过大'), { code: 'INVALID_PANEL_IMAGE' });
+  const oriented = await sharp(bytes, { limitInputPixels: 24_000_000, failOn: 'warning' }).rotate().toBuffer();
+  const metadata = await sharp(oriented, { limitInputPixels: 24_000_000, failOn: 'warning' }).metadata();
+  if (!metadata.width || !metadata.height || metadata.width * metadata.height > 24_000_000) throw Object.assign(new Error('画格图片尺寸无效或过大'), { code: 'INVALID_PANEL_IMAGE' });
   const fit = ['contain', 'stretch'].includes(panel.fit) ? panel.fit : 'cover';
-  let pipeline = sharp(oriented, { limitInputPixels: 60_000_000, failOn: 'warning' });
+  let pipeline = sharp(oriented, { limitInputPixels: 24_000_000, failOn: 'warning' });
   if (fit === 'stretch') pipeline = pipeline.resize(width, height, { fit: 'fill' });
   else if (fit === 'contain') pipeline = pipeline.resize(width, height, { fit: 'contain', background });
   else {
