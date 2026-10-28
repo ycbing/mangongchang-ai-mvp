@@ -73,7 +73,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 
 ## API
 
-前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。错误响应包含 `error.code`、`error.message` 和 `requestId`。
+前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。错误响应包含 `error.code`、`error.message` 和 `requestId`。
 
 ## Docker Compose 部署
 
