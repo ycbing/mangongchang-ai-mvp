@@ -37,6 +37,7 @@ services:
       redis:
         condition: service_healthy
     environment:
+      SERVICE_ROLE: web
       HOST: 0.0.0.0
       PORT: 4173
       DATABASE_URL: postgresql://mangongchang:${POSTGRES_PASSWORD}@postgres:5432/mangongchang
@@ -44,6 +45,15 @@ services:
       JOB_CONCURRENCY: ${JOB_CONCURRENCY:-2}
       JOB_DISPATCH_INTERVAL_MS: ${JOB_DISPATCH_INTERVAL_MS:-5000}
       AUTH_PASSWORD: ${AUTH_PASSWORD:?Set AUTH_PASSWORD in .env}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      IMAGE_PROVIDER: ${IMAGE_PROVIDER:-mock}
+      IMAGE_BASE_URL: ${IMAGE_BASE_URL:-}
+      IMAGE_API_KEY: ${IMAGE_API_KEY:-}
+      IMAGE_MODEL: ${IMAGE_MODEL:-}
+      IMAGE_SIZE: ${IMAGE_SIZE:-1024x1536}
       LOCAL_STORAGE_DIR: /data/assets
       S3_ENDPOINT: ${S3_ENDPOINT:-}
       S3_REGION: ${S3_REGION:-us-east-1}
@@ -61,6 +71,40 @@ services:
       timeout: 5s
       retries: 3
       start_period: 45s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    environment:
+      SERVICE_ROLE: worker
+      DATABASE_URL: postgresql://mangongchang:${POSTGRES_PASSWORD}@postgres:5432/mangongchang
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JOB_CONCURRENCY: ${JOB_CONCURRENCY:-2}
+      LOCAL_STORAGE_DIR: /data/assets
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      IMAGE_PROVIDER: ${IMAGE_PROVIDER:-mock}
+      IMAGE_BASE_URL: ${IMAGE_BASE_URL:-}
+      IMAGE_API_KEY: ${IMAGE_API_KEY:-}
+      IMAGE_MODEL: ${IMAGE_MODEL:-}
+      IMAGE_SIZE: ${IMAGE_SIZE:-1024x1024}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-false}
+    volumes:
+      - comic_assets:/data/assets
 
   backup:
     profiles: ["backup"]

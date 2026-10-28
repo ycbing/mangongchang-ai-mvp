@@ -85,7 +85,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 docker compose up --build -d
 ```
 
-Compose 会先等待 PostgreSQL 和 Redis 健康，再启动应用并自动执行数据库迁移；`/api/v1/health` 会检查数据库与 Redis 的连接，依赖不可用时返回 HTTP 503。应用容器用该接口做健康检查，可用 `docker compose ps` 查看服务状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；应用启动会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
+Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动执行数据库迁移；独立 worker 在 Web 健康后启动，消费 BullMQ 任务。`/api/v1/health` 会检查数据库和 Web 到 Redis 的连接，依赖不可用时返回 HTTP 503。可用 `docker compose ps` 查看 Web、worker 和依赖状态。PostgreSQL、Redis 队列和本地图片分别保存在 Docker 持久卷中。访问 `http://localhost:4173`。如需对象存储，在 `.env` 配置 `S3_BUCKET`、区域、端点及访问凭证；Web 与 worker 都会检查 bucket，上传、读取和迁移都会走 S3 适配层。公网使用时应在前方配置 HTTPS 反向代理，并按部署环境配置备份。
 
 ### S3 兼容图片存储
 
@@ -96,4 +96,4 @@ Compose 会先等待 PostgreSQL 和 Redis 健康，再启动应用并自动执�
 
 ### 任务队列
 
-本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ，应用会把数据库中的排队任务按任务 ID 投递到 Redis；worker 使用数据库条件更新领取任务，避免同一任务被重复执行。Redis 连接中断时，数据库里的 queued 任务会由后台定时器重新投递。绘图任务会校验目标作品和画格归属；批量任务拒绝重复画格，并在数据库事务中一起检查 20 项容量上限和写入，避免超额或部分入队。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。当前 worker 仍随应用进程启动，正式横向扩容前还需完成多实例状态同步和独立 worker 部署。
+本地默认使用数据库持久化记录加进程内 worker，不需要 Redis。设置 `REDIS_URL` 后启用 BullMQ；可通过 `SERVICE_ROLE=web` 和 `SERVICE_ROLE=worker` 将 Web 与 worker 分开，Docker Compose 已分别配置两个服务。Web 定时投递数据库中的 queued 任务，worker 使用数据库条件更新领取任务，避免同一任务被重复执行；worker 定时恢复超过 5 分钟租约的 running 任务。Web 在读取/修改作品状态前刷新快照，写入使用 revision 条件提交；worker 从数据库最新快照合并画格结果并在冲突时重试。取消状态由 worker 每秒轮询数据库，因此不依赖进程内共享内存。绘图任务会校验目标作品和画格归属；批量任务拒绝重复画格，并在数据库事务中一起检查 20 项容量上限和写入，避免超额或部分入队。Docker Compose 默认带持久化 Redis，并设置 `maxmemory-policy=noeviction`。当前主产品仍是单创作者；多实例 worker 仍需 Redis 环境做中断恢复集成验收。

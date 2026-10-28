@@ -46,9 +46,9 @@
 - 验收：小废柴 8 格从创建到导出；切片无空白缺格、顺序和对白正确；mock 无密钥可用。
 
 ## 当前说明
-阶段 0–4 的单创作者本机闭环已完成。阶段 5 已增加 PostgreSQL 单实例运行、版本化迁移、SQLite 导入与 Docker Compose 部署模板，并通过临时 PostgreSQL 实例完成迁移、读写、重启恢复和导入验收。生产环境仍需独立 worker 与状态同步，才能支持多实例；当前任务已可选 Redis/BullMQ；图片存储已可配置 S3 兼容服务（尚未连真实 S3 实例验收）；多人协作、云端同步和公开发布仍按 P2 范围处理。JSON 备份不包含图片二进制，跨机器迁移需复制本地图片目录。角色参考图尚未发送给不支持参考图的通用绘图端点；图片尺寸/解码的最终检查依赖浏览器。真实供应商调用需部署者提供凭证并验证。
+阶段 0–4 的单创作者本机闭环已完成。阶段 5 已增加 PostgreSQL 单实例运行、版本化迁移、SQLite 导入与 Docker Compose 部署模板，并通过临时 PostgreSQL 实例完成迁移、读写、重启恢复和导入验收。Compose 现将 Web 与 BullMQ worker 拆成独立服务；快照读写增加 revision 刷新、条件提交与 worker 冲突重试。Redis/BullMQ 的真实中断恢复、Compose 多服务启动和 S3 对象读写仍需在对应运行环境集成验收；多人协作、云端同步和公开发布仍按 P2 范围处理。JSON 备份不包含图片二进制，跨机器迁移需复制本地图片目录。角色参考图尚未发送给不支持参考图的通用绘图端点；图片尺寸/解码的最终检查依赖浏览器。真实供应商调用需部署者提供凭证并验证。
 
-云端同步、多人协作和公开发布属于产品文档明确列出的 P2 / 明确不做范围。当前产品仍是单创作者、单实例服务；部署版可连接 PostgreSQL 和 S3 兼容存储，真实 AI 生成需部署者提供服务凭证。Redis/BullMQ 可用于持久化排队与 worker 投递；多实例运行仍需独立 worker 服务及状态同步。
+云端同步、多人协作和公开发布属于产品文档明确列出的 P2 / 明确不做范围。当前产品仍是单创作者；部署版可连接 PostgreSQL 和 S3 兼容存储，真实 AI 生成需部署者提供服务凭证。Redis/BullMQ Web/worker 已支持独立进程；生产扩容前仍须完成真实 Redis 中断恢复、S3 上传/读取和 Compose 运行验收。
 
 ### 5. PostgreSQL 部署基础
 - [x] 抽出 SQLite/PostgreSQL 异步数据库适配层；`DATABASE_URL` 选择 PostgreSQL，否则使用本地 SQLite。
@@ -71,7 +71,9 @@
 ### 7. 可靠任务队列
 - [x] 增加可选 Redis/BullMQ 队列、数据库 queued 任务定时补投递和原子任务领取。
 - [x] 进程内队列保持本地无 Redis 可用；Docker Compose 默认配置持久化 Redis 与 noeviction。
-- [ ] 在真实 Redis 环境验证 BullMQ 中断恢复与任务领取；再完成独立 worker 和多实例状态同步。
+- [x] 增加独立 `SERVICE_ROLE=web|worker`；Compose 分别运行 Web 与 BullMQ worker，worker 通过 revision 安全地合并画格结果。
+- [x] 使用真实临时 PostgreSQL 实例验证 Web/worker 并发状态变更都保留、revision 单调递增、过期 revision 被拒绝。
+- [ ] 在真实 Redis/Docker 环境验证 BullMQ 中断恢复、worker 租约恢复与 Compose 多服务启动。
 
 ### 8. PostgreSQL 备份与恢复
 - [x] 增加 PostgreSQL custom-format 备份命令，并将本地图片目录打包到同一备份目录。

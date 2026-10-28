@@ -6,6 +6,14 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { openDatabase } from '../db-adapter.mjs';
 import { insertJobsWithinLimit } from '../job-admission.mjs';
+import { createJobQueue } from '../job-queue.mjs';
+
+test('separate web and worker roles require the shared Redis queue', async () => {
+  const localQueue = await createJobQueue({ redisUrl: '', role: 'combined' });
+  assert.equal(localQueue.kind, 'in-process');
+  await assert.rejects(createJobQueue({ redisUrl: '', role: 'web' }), /requires REDIS_URL/);
+  await assert.rejects(createJobQueue({ redisUrl: '', role: 'worker' }), /requires REDIS_URL/);
+});
 
 test('job admission serializes concurrent batches and rolls back over-capacity writes', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'mangongchang-jobs-'));

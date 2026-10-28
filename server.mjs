@@ -7,6 +7,7 @@ import { openAssetStorage } from './asset-storage.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { insertJobsWithinLimit } from './job-admission.mjs';
 import { validateCanvasSettings, validateCharacterInput } from './validation.mjs';
+import { mutateSnapshot, persistSnapshot } from './state-store.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
@@ -28,6 +29,8 @@ const dbFile = resolve(process.env.DATABASE_PATH || join(dataDir, 'mangongchang.
 const legacyFile = join(dataDir, 'state.json');
 const port = Number(process.env.PORT || 4173);
 const host = process.env.HOST || '127.0.0.1';
+const serviceRole = process.env.SERVICE_ROLE || 'combined';
+if (!['combined', 'web', 'worker'].includes(serviceRole)) throw new Error('SERVICE_ROLE must be combined, web, or worker');
 const maxBodyBytes = Number(process.env.MAX_REQUEST_MB || 20) * 1_000_000;
 const maxImageBytes = Number(process.env.MAX_IMAGE_UPLOAD_MB || 10) * 1_000_000;
 const ownerId = 'local-owner';
@@ -79,7 +82,8 @@ function defaultState() {
   return { schemaVersion:1, characters:[{id:'char-xfc',name:'小废柴',summary:'认真又想准时下班的普通上班族',look:'圆脸、黑色短发和两撮翘起的呆毛；宽松浅黄色卫衣、深蓝长裤、白色运动鞋；胸前有绿色叶片徽章。',style:'清爽二维网络漫画，暖色平涂，深棕描边，柔和浅阴影。',archivedAt:null}], works:[], activeId:null };
 }
 let stateRow = await db.prepare('SELECT revision,snapshot FROM app_state WHERE id=1').get();
-if (!stateRow) {
+const freshState = !stateRow;
+if (freshState) {
   let initial = defaultState();
   if (existsSync(legacyFile)) {
     try {
@@ -117,6 +121,8 @@ if (!stateRow) {
 }
 let revision=Number(stateRow.revision);
 let state=JSON.parse(stateRow.snapshot);
+const stateRevisionBySnapshot=new WeakMap([[state,revision]]);
+let stateOperationQueue=Promise.resolve();
 await db.prepare('INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING').run(ownerId,null,null,Date.now());
 async function syncProjection(snapshot, tx = db) {
   await tx.prepare('DELETE FROM panels').run(); await tx.prepare('DELETE FROM work_characters').run();
@@ -132,29 +138,23 @@ async function syncProjection(snapshot, tx = db) {
     for(let i=0;i<(w.panels||[]).length;i++) { const p=w.panels[i], current=p.imageVersions?.find(v=>v.version===p.version); await putPanel.run(p.id,w.id,i,JSON.stringify({scene:p.scene||'',action:p.action||'',camera:p.camera||'',expression:p.expression||'',dialogue:p.dialogue||'',caption:p.caption||'',sfx:p.sfx||'',imagePrompt:p.imagePrompt||'',negativePrompt:p.negativePrompt||'',tone:p.tone||''}),JSON.stringify({ratio:w.settings?.ratio||'4/5',fit:p.fit||'cover',focalPoint:p.focalPoint||{x:.5,y:.5},dialogueLayout:p.dialogueLayout||null,captionLayout:p.captionLayout||null,elements:p.elements||[]}),current?.assetId||null,p.generationStatus||'draft',w.updatedAt||Date.now()); }
   }
 }
-await syncProjection(state);
+  if(freshState&&serviceRole!=='worker')await db.transaction(tx=>syncProjection(state,tx));
 async function saveState(next, expectedRevision) {
-  let outcome;
+  const explicitlyVersioned=expectedRevision!==undefined,compareRevision=explicitlyVersioned?Number(expectedRevision):(stateRevisionBySnapshot.get(next)??revision);let outcome;
   try {
-    await db.transaction(async tx => {
-      const current=await tx.prepare(`SELECT revision,snapshot FROM app_state WHERE id=1${db.kind==='postgres'?' FOR UPDATE':''}`).get();
-      const actual=Number(current.revision);
-      if (expectedRevision !== undefined && Number(expectedRevision)!==actual) { outcome={conflict:true,revision:actual,snapshot:JSON.parse(current.snapshot)}; return; }
-      const nextRevision=actual+1, now=Date.now(), json=JSON.stringify(next);
-      await tx.prepare('UPDATE app_state SET revision=?,snapshot=?,updated_at=? WHERE id=1').run(nextRevision,json,now);
-      await tx.prepare('INSERT INTO state_history(revision,snapshot,created_at) VALUES(?,?,?)').run(nextRevision,json,now);
-      await syncProjection(next, tx);
-      await tx.prepare('DELETE FROM state_history WHERE revision NOT IN (SELECT revision FROM state_history ORDER BY revision DESC LIMIT 50)').run();
-      outcome={revision:nextRevision};
-    });
+    outcome=await persistSnapshot(db,next,compareRevision,syncProjection);
   } catch (error) {
     try { const persisted=await db.prepare('SELECT revision,snapshot FROM app_state WHERE id=1').get(); if (persisted) { state=JSON.parse(persisted.snapshot); revision=Number(persisted.revision); } } catch { /* Preserve the original persistence error. */ }
     throw error;
   }
-  if (outcome?.revision) { state=next; revision=outcome.revision; }
-  if (outcome?.conflict) { state=outcome.snapshot; revision=outcome.revision; }
+  if (outcome?.revision) { state=next; revision=outcome.revision; stateRevisionBySnapshot.set(next,revision); }
+  if (outcome?.conflict) { state=outcome.snapshot; revision=outcome.revision; stateRevisionBySnapshot.set(state,revision); }
+  if(outcome?.conflict&&!explicitlyVersioned)throw Object.assign(new Error('作品已在其他进程更新，请刷新后重试'),{status:409,code:'REVISION_CONFLICT'});
   return outcome;
 }
+async function refreshStateCache(){const row=await db.prepare('SELECT revision,snapshot FROM app_state WHERE id=1').get();if(!row)throw new Error('作品状态尚未初始化');const latestRevision=Number(row.revision);if(latestRevision!==revision){state=JSON.parse(row.snapshot);revision=latestRevision;stateRevisionBySnapshot.set(state,revision);}return {state,revision};}
+async function mutateStoredState(mutator){return mutateSnapshot(db,mutator,syncProjection,(snapshot,nextRevision)=>{state=snapshot;revision=nextRevision;stateRevisionBySnapshot.set(snapshot,nextRevision);});}
+async function acquireStateOperation(){const previous=stateOperationQueue;let release;stateOperationQueue=new Promise(resolve=>{release=resolve;});await previous;return release;}
 function rowToJob(row) {
   return {id:row.id,ownerId:row.owner_id,type:row.type,status:row.status,progress:row.progress,input:JSON.parse(row.input_json),result:row.result_json?JSON.parse(row.result_json):null,error:row.error_json?JSON.parse(row.error_json):null,idempotencyKey:row.idempotency_key,previousJobId:row.previous_job_id,attempts:Number(row.attempts),createdAt:Number(row.created_at),startedAt:row.started_at===null?null:Number(row.started_at),finishedAt:row.finished_at===null?null:Number(row.finished_at)};
 }
@@ -225,7 +225,7 @@ async function callImageProvider(input,signal){
 function transientError(error){return error.name==='AbortError'||[429,500,502,503,504].includes(Number(error.status));}
 async function runJob(job){
   jobsById.set(job.id,{...job,controller:null});const controller=new AbortController();jobsById.get(job.id).controller=controller;
-  const timeoutMs=job.type==='storyboard'?120000:180000;const timeout=setTimeout(()=>controller.abort(),timeoutMs);
+  const timeoutMs=job.type==='storyboard'?120000:180000;const timeout=setTimeout(()=>controller.abort(),timeoutMs),cancellationPoll=setInterval(()=>void getJob(job.id).then(current=>{if(current?.status==='cancel_requested')controller.abort()}).catch(()=>{}),1000);cancellationPoll.unref();
   try {
     let result;
     for(let attempt=0;;attempt++){
@@ -236,21 +236,14 @@ async function runJob(job){
     if(job.status==='cancelled'||persisted?.status==='cancel_requested')job.status='cancelled';
     else {job.status='succeeded';job.progress=100;job.result={...result,completedAt:Date.now()};}
     job.finishedAt=Date.now();await saveJob(job);
-    if(job.type==='panel_image'){
-      const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);
-      if(p){
-        if(job.status==='succeeded'){p.versions=p.versions||[1];p.imageVersions=p.imageVersions||[];const v=p.versions.length?Math.max(...p.versions)+1:1;p.versions.push(v);p.version=v;if(job.result?.imageUrl)p.imageVersions.push({version:v,url:job.result.imageUrl,assetId:job.result.assetId,createdAt:Date.now()});p.generationStatus='succeeded';p.appliedJobId=job.id;}
-        else p.generationStatus='cancelled';
-        w.updatedAt=Date.now();await saveState(state);
-      }
-    }
+    if(job.type==='panel_image')await mutateStoredState(snapshot=>{const w=snapshot.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(!p)return false;if(job.status==='succeeded'&&p.appliedJobId!==job.id){p.versions=p.versions||[1];p.imageVersions=p.imageVersions||[];const version=p.versions.length?Math.max(...p.versions)+1:1;p.versions.push(version);p.version=version;if(job.result?.imageUrl)p.imageVersions.push({version,url:job.result.imageUrl,assetId:job.result.assetId,createdAt:Date.now()});p.generationStatus='succeeded';p.appliedJobId=job.id;}else if(job.status!=='succeeded')p.generationStatus='cancelled';w.updatedAt=Date.now();return true;});
   } catch(error){
     let persisted=null;try{persisted=await getJob(job.id);}catch{}
     if(job.status==='cancelled'||persisted?.status==='cancel_requested')job.status='cancelled';
     else{job.status='failed';job.progress=0;job.error={code:error.name==='AbortError'?'PROVIDER_TIMEOUT':error.code||'PROVIDER_ERROR',message:error.name==='AbortError'?'模型任务已超时或取消':error.message||'任务失败',retryable:transientError(error)};}
     job.finishedAt=Date.now();await saveJob(job);
-    if(job.type==='panel_image'){const w=state.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(p){p.generationStatus=job.status;p.lastJobError=job.error?.message||null;w.updatedAt=Date.now();await saveState(state);}}
-  } finally {clearTimeout(timeout);jobsById.delete(job.id);if(job.type==='panel_image'&&jobQueue?.kind==='in-process')runningImages--;schedulePump();}
+    if(job.type==='panel_image')await mutateStoredState(snapshot=>{const w=snapshot.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(!p)return false;p.generationStatus=job.status;p.lastJobError=job.error?.message||null;w.updatedAt=Date.now();return true;});
+  } finally {clearTimeout(timeout);clearInterval(cancellationPoll);jobsById.delete(job.id);if(job.type==='panel_image'&&jobQueue?.kind==='in-process')runningImages--;schedulePump();}
 }
 async function claimQueuedJob(jobId){
   const row=await db.prepare("UPDATE jobs SET status='running',started_at=?,progress=5,attempts=attempts+1 WHERE id=? AND owner_id=? AND status='queued' RETURNING *").get(Date.now(),jobId,ownerId);
@@ -269,8 +262,8 @@ async function processQueuedJob(jobId,imageSlotReserved=false){
   }
 }
 const queueConcurrency=Math.max(1,Math.min(8,Number(process.env.JOB_CONCURRENCY)||2));
-const jobQueue=await createJobQueue({redisUrl:process.env.REDIS_URL||'',concurrency:queueConcurrency,processJob:processQueuedJob});
-function schedulePump(){if(pumpScheduled)return;pumpScheduled=true;setImmediate(()=>{pumpScheduled=false;void pumpQueue().catch(error=>console.error(JSON.stringify({component:'job-dispatcher',code:error.code||'DISPATCH_ERROR'})));});}
+const jobQueue=await createJobQueue({redisUrl:process.env.REDIS_URL||'',concurrency:queueConcurrency,processJob:processQueuedJob,role:serviceRole});
+function schedulePump(){if(serviceRole==='worker'||pumpScheduled)return;pumpScheduled=true;setImmediate(()=>{pumpScheduled=false;void pumpQueue().catch(error=>console.error(JSON.stringify({component:'job-dispatcher',code:error.code||'DISPATCH_ERROR'})));});}
 async function pumpQueue(){
   const rows=await db.prepare("SELECT * FROM jobs WHERE owner_id=? AND status='queued' ORDER BY created_at LIMIT 20").all(ownerId);
   for(const row of rows){
@@ -282,16 +275,18 @@ async function pumpQueue(){
     void processQueuedJob(job.id,imageSlotReserved).catch(error=>console.error(JSON.stringify({component:'job-worker',jobId:job.id,code:error.code||'JOB_PROCESS_ERROR'})));
   }
 }
-let queueRecoveryTimer;
-if(jobQueue.kind==='bullmq'){
+let queueRecoveryTimer,staleJobRecoveryTimer;
+if(jobQueue.kind==='bullmq'&&serviceRole!=='worker'){
   const interval=Math.max(1000,Number(process.env.JOB_DISPATCH_INTERVAL_MS)||5000);
   queueRecoveryTimer=setInterval(schedulePump,interval);queueRecoveryTimer.unref();
 }
+if(serviceRole==='worker'){staleJobRecoveryTimer=setInterval(()=>void recoverStaleJobs().catch(error=>console.error(JSON.stringify({component:'job-recovery',code:error.code||'JOB_RECOVERY_ERROR'}))),30_000);staleJobRecoveryTimer.unref();}
 // Expire works after the documented 30-day soft-delete recovery window.
-const expiry=Date.now()-30*86400_000,previousCount=state.works.length;state.works=state.works.filter(w=>!w.deletedAt||w.deletedAt>expiry);if(state.works.length!==previousCount)await saveState(state);
-// Recover unfinished work after process restarts. Inputs and job identity remain stable.
-await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status='running'").run(ownerId);await db.prepare("UPDATE jobs SET status='cancelled',finished_at=? WHERE owner_id=? AND status='cancel_requested'").run(Date.now(),ownerId);await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());
-schedulePump();
+if(serviceRole!=='worker'){const expiry=Date.now()-30*86400_000,previousCount=state.works.length;state.works=state.works.filter(w=>!w.deletedAt||w.deletedAt>expiry);if(state.works.length!==previousCount)await saveState(state);}
+if(serviceRole==='combined'){await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status='running'").run(ownerId);await db.prepare("UPDATE jobs SET status='cancelled',finished_at=? WHERE owner_id=? AND status='cancel_requested'").run(Date.now(),ownerId);}
+async function recoverStaleJobs(){const staleBefore=Date.now()-5*60_000;await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status='running' AND started_at<?").run(ownerId,staleBefore);await db.prepare("UPDATE jobs SET status='cancelled',finished_at=? WHERE owner_id=? AND status='cancel_requested' AND started_at<?").run(Date.now(),ownerId,staleBefore);}
+if(serviceRole==='worker')await recoverStaleJobs();
+if(serviceRole!=='worker'){await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());schedulePump();}
 function safeConfig(){return {llm:{provider:configured('storyboard')?'connected':'mock',model:configured('storyboard')?providerConfig.llmModel:null},image:{provider:configured('panel_image')?'connected':'mock',model:configured('panel_image')?providerConfig.imageModel:null}};}
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp'};
 const publicFiles=new Set(['index.html','app.js']);
@@ -305,6 +300,7 @@ async function isAuthenticated(req){if(!authEnabled)return true;const token=sess
 function sameOrigin(req){const source=req.headers.origin||req.headers.referer,host=req.headers.host;if(!source||!host)return false;try{const origin=new URL(source),requestHost=new URL(`http://${host}`).host;return ['http:','https:'].includes(origin.protocol)&&origin.host===requestHost;}catch{return false;}}
 const server=createServer(async(req,res)=>{
   const requestId=randomUUID();res.setHeader('x-request-id',requestId);
+  let releaseStateOperation;
   try{
     if(!rateLimit(req))return send(res,429,{error:{code:'RATE_LIMITED',message:'请求过于频繁，请稍后再试'},requestId});
     const url=new URL(req.url||'/',`http://${req.headers.host||'localhost'}`),path=decodeURIComponent(url.pathname);
@@ -318,6 +314,8 @@ const server=createServer(async(req,res)=>{
     if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&path.startsWith('/assets/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&!sameOrigin(req)&&!['GET','HEAD','OPTIONS'].includes(req.method))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
+    const usesState=path==='/api/v1/state'||path==='/api/v1/works'||path.startsWith('/api/v1/works/')||path==='/api/v1/characters'||path.startsWith('/api/v1/characters/')||(path==='/api/v1/jobs'&&req.method==='POST');
+    if(usesState){releaseStateOperation=await acquireStateOperation();await refreshStateCache();}
     if(req.method==='GET'&&path==='/api/v1/health'){
       const [databaseOk,queueOk]=await Promise.all([
         db.prepare('SELECT 1 AS ok').get().then(()=>true).catch(()=>false),
@@ -422,7 +420,7 @@ const server=createServer(async(req,res)=>{
       }catch{return send(res,404,{error:{code:'NOT_FOUND',message:'页面不存在'},requestId});}
     }
     return send(res,404,{error:{code:'NOT_FOUND',message:'接口不存在'},requestId});
-  }catch(error){const status=error.status||500;console.error(JSON.stringify({requestId,code:error.code||'INTERNAL_ERROR',status}));return send(res,status,{error:{code:status===413?'PAYLOAD_TOO_LARGE':status===400?'BAD_JSON':error.code||'INTERNAL_ERROR',message:status>=500?'服务暂时不可用':error.message||'请求无效'},requestId});}
+  }catch(error){const status=error.status||500;console.error(JSON.stringify({requestId,code:error.code||'INTERNAL_ERROR',status}));return send(res,status,{error:{code:status===413?'PAYLOAD_TOO_LARGE':status===400?'BAD_JSON':error.code||'INTERNAL_ERROR',message:status>=500?'服务暂时不可用':error.message||'请求无效'},requestId});}finally{releaseStateOperation?.();}
 });
-server.listen(port,host,()=>console.log(`漫工厂 AI 已启动：http://${host}:${port}`));
-for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ server.close(async()=>{ try { if(queueRecoveryTimer)clearInterval(queueRecoveryTimer); await jobQueue.close(); await db.close(); } finally { await assetStorage.close(); process.exit(0); } }); setTimeout(()=>process.exit(1),10_000).unref(); });
+if(serviceRole!=='worker')server.listen(port,host,()=>console.log(`漫工厂 AI 已启动：http://${host}:${port}`));
+for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ const cleanup=async()=>{try{if(queueRecoveryTimer)clearInterval(queueRecoveryTimer);if(staleJobRecoveryTimer)clearInterval(staleJobRecoveryTimer);await jobQueue.close();await db.close();await assetStorage.close();process.exit(0);}catch{process.exit(1);}};if(server.listening)server.close(cleanup);else void cleanup();setTimeout(()=>process.exit(1),10_000).unref(); });
