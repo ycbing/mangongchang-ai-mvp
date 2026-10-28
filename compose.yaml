@@ -62,7 +62,50 @@ services:
       retries: 3
       start_period: 45s
 
+  backup:
+    profiles: ["backup"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://mangongchang:${POSTGRES_PASSWORD}@postgres:5432/mangongchang
+      LOCAL_STORAGE_DIR: /assets
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETRY_SECONDS: ${BACKUP_RETRY_SECONDS:-300}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-90}
+      S3_BUCKET: ${S3_BUCKET:-}
+    volumes:
+      - comic_assets:/assets:ro
+      - backup_data:/backups
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        node -e 'const limits={BACKUP_INTERVAL_SECONDS:[60,31536000],BACKUP_RETRY_SECONDS:[30,86400],BACKUP_KEEP:[1,1000],BACKUP_RETENTION_DAYS:[7,3650]}; for(const [key,[min,max]] of Object.entries(limits)){const value=Number(process.env[key]);if(!Number.isSafeInteger(value)||value<min||value>max){console.error(key+" must be an integer between "+min+" and "+max);process.exit(1)}}'
+        while true; do
+          if [ -n "$${S3_BUCKET}" ]; then
+            echo "S3 图片存储已启用；容器备份已暂停，请使用对象存储侧备份策略。"
+            sleep "$${BACKUP_INTERVAL_SECONDS}"
+            continue
+          fi
+          if node /app/scripts/backup-postgres.mjs; then
+            node /app/scripts/prune-backups.mjs --apply --keep="$${BACKUP_KEEP}" --retention-days="$${BACKUP_RETENTION_DAYS}" || echo "备份保留清理失败；现有备份已保留。"
+            sleep "$${BACKUP_INTERVAL_SECONDS}"
+          else
+            echo "PostgreSQL 备份失败；跳过清理并在 $${BACKUP_RETRY_SECONDS} 秒后重试。"
+            sleep "$${BACKUP_RETRY_SECONDS}"
+          fi
+        done
+
 volumes:
   postgres_data:
   redis_data:
   comic_assets:
+  backup_data:

@@ -1,0 +1,12 @@
+FROM postgres:17-alpine
+
+RUN apk add --no-cache nodejs \
+  && node -e "if (Number(process.versions.node.split('.')[0]) < 22) process.exit(1)" \
+  && mkdir -p /backups /assets \
+  && chown postgres:postgres /backups /assets
+
+WORKDIR /app
+COPY --chown=postgres:postgres scripts/backup-postgres.mjs scripts/prune-backups.mjs scripts/env.mjs ./scripts/
+ENV BACKUP_DIR=/backups LOCAL_STORAGE_DIR=/assets
+USER postgres
+ENTRYPOINT []

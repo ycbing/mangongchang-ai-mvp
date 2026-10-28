@@ -1,4 +1,6 @@
+import { createReadStream } from 'node:fs';
 import { lstat, readFile, readdir, rm, realpath } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join, resolve, sep } from 'node:path';
 import { root } from './env.mjs';
 
@@ -43,22 +45,35 @@ for (const entry of await readdir(canonicalRoot, { withFileTypes: true })) {
     skipped.push(`${entry.name}（备份清单格式或时间无效）`); continue;
   }
   const listedFiles = new Map(manifest.files.map(file => [file.file, file]));
-  let valid = ['database.dump', 'assets.tar.gz'].every(name => listedFiles.has(name));
+  let valid = manifest.files.length === 2 && listedFiles.size === 2 && ['database.dump', 'assets.tar.gz'].every(name => listedFiles.has(name));
   let sizeBytes = manifestInfo.size;
+  const files = [];
   for (const [name, file] of listedFiles) {
     if (!['database.dump', 'assets.tar.gz'].includes(name) || !Number.isSafeInteger(file.sizeBytes) || file.sizeBytes < 0 || !/^[a-f0-9]{64}$/.test(file.sha256)) { valid = false; break; }
     const path = join(directory, name);
     const fileInfo = await lstat(path).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error));
     if (!fileInfo?.isFile() || fileInfo.isSymbolicLink() || fileInfo.size !== file.sizeBytes) { valid = false; break; }
     sizeBytes += fileInfo.size;
+    files.push({ path, expectedSha256: file.sha256 });
   }
   if (!valid) { skipped.push(`${entry.name}（备份文件与清单不匹配）`); continue; }
   if (!directory.startsWith(canonicalRoot + sep)) throw new Error('清理路径越界，已停止。');
-  backups.push({ name: entry.name, directory, createdAt, sizeBytes });
+  backups.push({ name: entry.name, directory, createdAt, sizeBytes, files });
 }
 
 backups.sort((a, b) => b.createdAt - a.createdAt);
-const prune = backups.filter((backup, index) => index >= keep && now - backup.createdAt >= retentionDays * 86400_000);
+const pruneCandidates = backups.filter((backup, index) => index >= keep && now - backup.createdAt >= retentionDays * 86400_000);
+const prune = [];
+for (const backup of pruneCandidates) {
+  let checksumsMatch = true;
+  for (const file of backup.files) {
+    const hash = createHash('sha256');
+    for await (const chunk of createReadStream(file.path)) hash.update(chunk);
+    if (hash.digest('hex') !== file.expectedSha256) { checksumsMatch = false; break; }
+  }
+  if (checksumsMatch) prune.push(backup);
+  else skipped.push(`${backup.name}（SHA-256 校验失败）`);
+}
 console.log(`${apply ? '清理模式' : '预览模式'}：已识别 ${backups.length} 个有效备份；保留最新 ${keep} 个，且只清理超过 ${retentionDays} 天的备份。`);
 if (!prune.length) console.log('没有符合清理条件的备份。');
 for (const backup of prune) {
