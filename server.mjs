@@ -8,6 +8,7 @@ import { createJobQueue } from './job-queue.mjs';
 import { insertJobsWithinLimit } from './job-admission.mjs';
 import { validateCanvasSettings, validateCharacterInput } from './validation.mjs';
 import { mutateSnapshot, persistSnapshot } from './state-store.mjs';
+import { createCompletedExport, listWorkExports } from './export-store.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, owner_id TEXT N
 CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, work_id TEXT, panel_id TEXT, kind TEXT NOT NULL, storage_key TEXT NOT NULL UNIQUE, mime_type TEXT NOT NULL, width INTEGER, height INTEGER, size_bytes INTEGER NOT NULL, checksum TEXT NOT NULL, metadata_json TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS assets_work_kind ON assets(owner_id,work_id,kind);
 CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, work_id TEXT NOT NULL, job_id TEXT NOT NULL, format TEXT NOT NULL, width INTEGER, height INTEGER, slice_count INTEGER NOT NULL DEFAULT 0, asset_ids_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, options_json TEXT NOT NULL, created_at INTEGER NOT NULL);`);
+  await db.exec('CREATE INDEX IF NOT EXISTS exports_owner_work_created ON exports(owner_id,work_id,created_at DESC)');
   const existingPanelColumns = await db.prepare('PRAGMA table_info(panels)').all();
   const existingPanelIdKey = existingPanelColumns.find(column => column.name === 'id');
   const existingPanelWorkKey = existingPanelColumns.find(column => column.name === 'work_id');
@@ -292,6 +294,7 @@ const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8',
 const publicFiles=new Set(['index.html','app.js']);
 function send(res,code,body,headers={}){res.writeHead(code,{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...headers});res.end(JSON.stringify(body));}
 async function bodyJson(req){let raw='';for await(const chunk of req){raw+=chunk;if(Buffer.byteLength(raw)>maxBodyBytes)throw Object.assign(new Error('请求内容过大'),{status:413});}try{return raw?JSON.parse(raw):{};}catch{throw Object.assign(new Error('JSON 格式无效'),{status:400});}}
+async function bodyBuffer(req,limit){const declared=Number(req.headers['content-length']||0);if(declared>limit)throw Object.assign(new Error('图片文件超过大小限制'),{status:413,code:'IMAGE_SIZE_LIMIT'});const chunks=[];let total=0;for await(const chunk of req){const bytes=Buffer.from(chunk);total+=bytes.byteLength;if(total>limit)throw Object.assign(new Error('图片文件超过大小限制'),{status:413,code:'IMAGE_SIZE_LIMIT'});chunks.push(bytes);}return Buffer.concat(chunks,total);}
 function rateLimit(req){const key=req.socket.remoteAddress||'local',now=Date.now(),old=rateLimits.get(key)||[];const recent=old.filter(t=>now-t<60000);if(recent.length>=300)return false;recent.push(now);rateLimits.set(key,recent);if(rateLimits.size>5000)rateLimits.delete(rateLimits.keys().next().value);return true;}
 function allowLoginAttempt(req){const key=req.socket.remoteAddress||'local',now=Date.now(),recent=(loginAttempts.get(key)||[]).filter(t=>now-t<900000);if(recent.length>=10){loginAttempts.set(key,recent);return false;}recent.push(now);loginAttempts.set(key,recent);if(loginAttempts.size>5000)loginAttempts.delete(loginAttempts.keys().next().value);return true;}
 function assetView(row){return {id:row.id,url:`/assets/${row.storage_key}`,kind:row.kind,mimeType:row.mime_type,width:row.width,height:row.height,sizeBytes:Number(row.size_bytes),createdAt:Number(row.created_at)};}
@@ -335,6 +338,15 @@ const server=createServer(async(req,res)=>{
     if(path==='/api/v1/assets/reference'&&req.method==='POST'){
       const input=await bodyJson(req);const type=readText(input.mimeType,100),base64=readText(input.data,Math.ceil(maxImageBytes*4/3)+100);if(!base64||!['image/png','image/jpeg','image/webp'].includes(type))return send(res,422,{error:{code:'INVALID_IMAGE',message:'请选择 PNG、JPEG 或 WebP 图片'},requestId});const bytes=Buffer.from(base64.replace(/^data:[^,]+,/,'').replace(/^base64,/,'').replace(/\s/g,''),'base64');if(!bytes.length||bytes.length>maxImageBytes)return send(res,413,{error:{code:'IMAGE_SIZE_LIMIT',message:`图片大小不能超过 ${Math.floor(maxImageBytes/1e6)} MB`},requestId});const asset=await saveImageAsset(bytes,type,{kind:'character_ref'});const row=await db.prepare('SELECT * FROM assets WHERE id=?').get(asset.assetId);return send(res,201,{asset:assetView(row)});
     }
+    if(path==='/api/v1/assets/export-slices'&&req.method==='POST'){
+      const workId=readText(url.searchParams.get('workId'),160),snapshotRow=await db.prepare('SELECT snapshot FROM app_state WHERE id=1').get();
+      const latest=snapshotRow?JSON.parse(snapshotRow.snapshot):null,work=latest?.works?.find(item=>item.id===workId&&!item.deletedAt);
+      if(!work)return send(res,404,{error:{code:'NOT_FOUND',message:'作品不存在'},requestId});
+      const bytes=await bodyBuffer(req,maxImageBytes*1.5),contentType=readText(req.headers['content-type'],100).split(';')[0].trim().toLowerCase();
+      if(!bytes.length||contentType!=='image/png')return send(res,422,{error:{code:'INVALID_IMAGE',message:'长图切片必须是 PNG 图片'},requestId});
+      const saved=await saveImageAsset(bytes,contentType,{workId,kind:'export_slice'}),row=await db.prepare('SELECT * FROM assets WHERE id=? AND owner_id=?').get(saved.assetId,ownerId);
+      return send(res,201,{asset:assetView(row)});
+    }
     if(path==='/api/v1/assets'&&req.method==='GET')return send(res,200,{items:(await db.prepare('SELECT * FROM assets WHERE owner_id=? ORDER BY created_at DESC LIMIT 200').all(ownerId)).map(assetView)});
     if(path==='/api/v1/works'&&req.method==='POST'){
       const input=await bodyJson(req),title=readText(input.title,120),count=input.panelCount===undefined?8:input.panelCount;
@@ -348,12 +360,39 @@ const server=createServer(async(req,res)=>{
     }
     const workRoute=path.match(/^\/api\/v1\/works\/([^/]+)(?:\/(storyboards|panels|image-jobs|exports|duplicate))?$/);
     if(workRoute){const [,workId,action]=workRoute,work=state.works.find(x=>x.id===workId&&!x.deletedAt);if(req.method==='GET'&&!action)return work?send(res,200,{work,revision}):send(res,404,{error:{code:'NOT_FOUND',message:'作品不存在'},requestId});if(!work)return send(res,404,{error:{code:'NOT_FOUND',message:'作品不存在'},requestId});
+      if(action==='exports'&&req.method==='GET'){
+        const items=await listWorkExports(db,ownerId,work.id);
+        for(const item of items){item.assets=[];for(const assetId of item.assetIds){const row=await db.prepare('SELECT id,storage_key FROM assets WHERE id=? AND owner_id=? AND work_id=? AND kind=?').get(assetId,ownerId,work.id,'export_slice');if(row)item.assets.push({assetId:row.id,url:`/assets/${row.storage_key}`});}}
+        return send(res,200,{items});
+      }
       if(req.method==='PATCH'&&!action){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision,requestId});if(input.title!==undefined){const title=readText(input.title,120);if(!title)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'作品标题不能为空'},requestId});work.title=title;}if(input.premise!==undefined)work.premise=readText(input.premise,2000);if(input.settings!==undefined)work.settings=validateCanvasSettings(input.settings,work.settings);if(input.archivedAt!==undefined&&input.archivedAt!==null&&!Number.isSafeInteger(input.archivedAt))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'归档时间无效'},requestId});if(input.archivedAt!==undefined)work.archivedAt=input.archivedAt;if(input.status!==undefined){if(!['draft','storyboarding','generating','editing','exporting','ready','failed'].includes(input.status))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'作品状态无效'},requestId});work.status=input.status;}work.updatedAt=Date.now();const result=await saveState(state,input.revision);return result.conflict?send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision:result.revision,requestId}):send(res,200,{work,revision});}
       if(req.method==='DELETE'&&!action){work.deletedAt=Date.now();work.updatedAt=Date.now();await saveState(state);return send(res,200,{deleted:true,undoUntil:Date.now()+30*86400_000,revision});}
       if(req.method==='POST'&&action==='duplicate'){const input=await bodyJson(req),copy=JSON.parse(JSON.stringify(work));copy.id=randomUUID();copy.title=readText(input.title,120)||work.title+'（副本）';copy.status='editing';copy.updatedAt=Date.now();copy.deletedAt=null;copy.archivedAt=null;state.works.unshift(copy);await saveState(state);return send(res,201,{work:copy,revision});}
       if(req.method==='PATCH'&&action==='panels'){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision,requestId});if(!Array.isArray(input.panels)||input.panels.length>20)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'画格数据无效'},requestId});const seen=new Set();for(const panel of input.panels){if(!panel.id||seen.has(panel.id)||!work.panels.some(x=>x.id===panel.id))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'画格顺序包含无效 ID'},requestId});seen.add(panel.id);}work.panels=input.panels.map((p,i)=>({...p,order:i}));work.updatedAt=Date.now();const result=await saveState(state,input.revision);return result.conflict?send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已更新'},revision:result.revision,requestId}):send(res,200,{saved:true,revision});}
       if(req.method==='POST'&&['storyboards','image-jobs','exports'].includes(action)){
-        const input=await bodyJson(req),type=action==='storyboards'?'storyboard':action==='exports'?'export':input.type==='batch'?'batch_image':'panel_image';
+        const input=await bodyJson(req);
+        if(action==='exports'){
+          if(!input||typeof input!=='object'||Array.isArray(input))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'导出信息无效'},requestId});
+          const idempotencyKey=readText(req.headers['idempotency-key'],160)||null;
+          if(idempotencyKey){
+            const prior=await db.prepare('SELECT id,type,input_json FROM jobs WHERE owner_id=? AND idempotency_key=?').get(ownerId,idempotencyKey);
+            if(prior){
+              const priorInput=JSON.parse(prior.input_json);
+              if(prior.type!=='export'||priorInput.workId!==work.id)return send(res,409,{error:{code:'IDEMPOTENCY_CONFLICT',message:'幂等键已用于其他任务或作品'},requestId});
+              const record=(await listWorkExports(db,ownerId,work.id)).find(item=>item.jobId===prior.id);
+              if(!record)return send(res,409,{error:{code:'EXPORT_IN_PROGRESS',message:'导出记录正在创建，请稍后重试'},requestId});
+              work.exports=work.exports||[];if(!work.exports.some(item=>item.jobId===record.jobId))work.exports.unshift({id:record.id,jobId:record.jobId,createdAt:record.createdAt,width:record.width,height:record.height,sliceCount:record.sliceCount,format:record.format,assetIds:record.assetIds,options:record.options});
+              work.exportedAt=record.createdAt;work.status='ready';work.updatedAt=record.createdAt;await saveState(state);
+              return send(res,200,{export:record,revision});
+            }
+          }
+          if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品已在其他窗口更新，导出记录未覆盖作品内容'},revision,state,requestId});
+          const record=await createCompletedExport(db,{ownerId,workId:work.id,assetIds:input.assetIds,width:input.width,height:input.height,options:input.options||{},idempotencyKey});
+          work.exports=work.exports||[];if(!work.exports.some(item=>item.jobId===record.jobId))work.exports.unshift({id:record.id,jobId:record.jobId,createdAt:record.createdAt,width:record.width,height:record.height,sliceCount:record.sliceCount,format:record.format,assetIds:record.assetIds,options:record.options});
+          work.exportedAt=record.createdAt;work.status='ready';work.updatedAt=record.createdAt;await saveState(state);
+          return send(res,201,{export:record,revision});
+        }
+        const type=action==='storyboards'?'storyboard':input.type==='batch'?'batch_image':'panel_image';
         if(type==='batch_image'){
           const ids=Array.isArray(input.panelIds)?input.panelIds:[];
           if(ids.length<1||ids.length>20||ids.some(id=>typeof id!=='string')||new Set(ids).size!==ids.length||ids.some(id=>!work.panels.some(panel=>panel.id===id)))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'批量绘图必须选择当前作品中 1–20 个不同画格'},requestId});
@@ -375,7 +414,7 @@ const server=createServer(async(req,res)=>{
     }
     const charRoute=path.match(/^\/api\/v1\/characters\/([^/]+)$/);if(charRoute){const c=state.characters.find(x=>x.id===charRoute[1]&&!x.deletedAt);if(!c)return send(res,404,{error:{code:'NOT_FOUND',message:'角色不存在'},requestId});if(req.method==='GET')return send(res,200,{character:c});if(req.method==='PATCH'){const input=await bodyJson(req);if(input.revision!==undefined&&Number(input.revision)!==revision)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'角色已更新'},revision,requestId});const fields=validateCharacterInput(input,{partial:true});if(fields.referenceAssetIds){const assets=[];for(const id of fields.referenceAssetIds){const asset=await db.prepare('SELECT id,storage_key FROM assets WHERE id=? AND owner_id=?').get(id,ownerId);if(!asset)return send(res,422,{error:{code:'VALIDATION_ERROR',message:'参考图片不存在或无权访问'},requestId});assets.push(asset);}c.referenceUrl=assets[0]?`/assets/${assets[0].storage_key}`:'';}Object.assign(c,fields);c.updatedAt=Date.now();await saveState(state,input.revision);return send(res,200,{character:c,revision});}if(req.method==='DELETE'){c.deletedAt=Date.now();c.updatedAt=Date.now();await saveState(state);return send(res,200,{deleted:true,revision});}}
     if(path==='/api/v1/jobs'&&req.method==='POST'){
-      const payload=await bodyJson(req);if(!['storyboard','panel_image','export','batch_image'].includes(payload.type))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'不支持的任务类型'},requestId});
+      const payload=await bodyJson(req);if(!['storyboard','panel_image','batch_image'].includes(payload.type))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'不支持的任务类型'},requestId});
       const input=payload.input||{};if(!input||typeof input!=='object'||Array.isArray(input))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'任务参数无效'},requestId});
       const idem=readText(req.headers['idempotency-key'],160)||readText(payload.idempotencyKey,160);if(idem){const found=await db.prepare('SELECT * FROM jobs WHERE owner_id=? AND idempotency_key=?').get(ownerId,idem);if(found)return send(res,200,rowToJob(found));}
       if(payload.type==='batch_image'){

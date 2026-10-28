@@ -65,7 +65,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 - 作品：新建（1–20 格）、搜索、过滤、复制、归档、回收站恢复和永久删除。
 - AI 流程：分镜 JSON 校验与一次修复、单格重绘版本、批量绘图、失败重试、取消和持久任务记录。
 - 编辑器：自动保存；保存冲突或断网时将草稿保留在浏览器并暂停自动覆盖，需明确选择载入服务器版或覆盖；格序拖放与快捷键、撤销/重做、画格比例/间距/背景、图片适配和焦点位置、版本对比。
-- 数据与导出：SQLite 开发存储或 PostgreSQL 部署存储、最多 50 个状态历史快照、JSON 作品备份导入/导出。导入会先校验版本、记录结构、ID、画布设置、资源地址和作品角色引用，整份校验通过后才合并；同 ID 记录覆盖前会提示。JSON 不包含图片二进制，跨环境迁移时需单独保留图片目录；PNG 长图按格边界切片并逐张下载。
+- 数据与导出：SQLite 开发存储或 PostgreSQL 部署存储、最多 50 个状态历史快照、JSON 作品备份导入/导出。导入会先校验版本、记录结构、ID、画布设置、资源地址和作品角色引用，整份校验通过后才合并；同 ID 记录覆盖前会提示。JSON 不包含图片二进制，跨环境迁移时需单独保留图片目录；PNG 长图当前由浏览器按格切片，完成后上传到资源存储并写入 PostgreSQL/SQLite 导出记录，可从导出对话框再次下载。上传/记录失败时仍可下载本地生成文件，但历史记录不会保存。
 
 ## 可选单账号访问保护
 
@@ -75,7 +75,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 
 ## API
 
-前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。错误响应包含 `error.code`、`error.message` 和 `requestId`。
+前缀 `/api/v1`，包括 `health`、`config`、`auth`、`state`、`works`、`characters`、`assets/reference`、`assets/export-slices`、`jobs` 和图片资源路由。状态写入支持 revision 冲突检测；创建作品时校验 1–20 格数量、角色归属和画布参数（比例 `4/5`、`3/4`、`1/1`，间距 8–32 px，背景为 `#RRGGBB`），更新作品使用相同画布约束。角色 API 只接受公开业务字段，参考资源须属于当前 owner。作品 `GET/POST /works/:id/exports` 提供持久化导出历史；导出切片上传仅允许 PNG、校验 owner/work 归属，元数据与成功任务在单一数据库事务中记录，并支持 `Idempotency-Key`。错误响应包含 `error.code`、`error.message` 和 `requestId`。
 
 ## Docker Compose 部署
 
