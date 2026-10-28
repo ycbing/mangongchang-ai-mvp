@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { mkdir } from 'node:fs/promises';
+import { boundedInteger } from './runtime-config.mjs';
 
 function pgSql(sql) {
   let index = 0;
@@ -12,7 +13,7 @@ function pgSql(sql) {
 export async function openDatabase({ databaseUrl, databasePath }) {
   if (databaseUrl) {
     const { Pool } = await import('pg');
-    const pool = new Pool({ connectionString: databaseUrl, max: Number(process.env.PG_POOL_MAX || 10), idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000, application_name: 'mangongchang-ai' });
+    const pool = new Pool({ connectionString: databaseUrl, max: boundedInteger('PG_POOL_MAX', 10, 1, 100), idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000, application_name: 'mangongchang-ai' });
     await pool.query('SELECT 1');
     return {
       kind: 'postgres',

@@ -10,6 +10,7 @@ import { validateCanvasSettings, validateCharacterInput } from './validation.mjs
 import { mutateSnapshot, persistSnapshot } from './state-store.mjs';
 import { createCompletedExport, listWorkExports } from './export-store.mjs';
 import { normalizeExportOptions, renderComicExports } from './export-renderer.mjs';
+import { boundedInteger } from './runtime-config.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
@@ -29,16 +30,16 @@ const dataDir = join(root, 'data');
 const assetDir = resolve(process.env.LOCAL_STORAGE_DIR || join(dataDir, 'assets'));
 const dbFile = resolve(process.env.DATABASE_PATH || join(dataDir, 'mangongchang.sqlite'));
 const legacyFile = join(dataDir, 'state.json');
-const port = Number(process.env.PORT || 4173);
+const port = boundedInteger('PORT', 4173, 1, 65535);
 const host = process.env.HOST || '127.0.0.1';
 const serviceRole = process.env.SERVICE_ROLE || 'combined';
 if (!['combined', 'web', 'worker'].includes(serviceRole)) throw new Error('SERVICE_ROLE must be combined, web, or worker');
-const maxBodyBytes = Number(process.env.MAX_REQUEST_MB || 20) * 1_000_000;
-const maxImageBytes = Number(process.env.MAX_IMAGE_UPLOAD_MB || 10) * 1_000_000;
+const maxBodyBytes = boundedInteger('MAX_REQUEST_MB', 20, 1, 200) * 1_000_000;
+const maxImageBytes = boundedInteger('MAX_IMAGE_UPLOAD_MB', 10, 1, 100) * 1_000_000;
 const ownerId = 'local-owner';
 const authPassword = process.env.AUTH_PASSWORD || '';
 const authEnabled = authPassword.length > 0;
-const sessionMs = Math.max(1, Math.min(30, Number(process.env.AUTH_SESSION_DAYS)||7))*86400_000;
+const sessionMs = boundedInteger('AUTH_SESSION_DAYS', 7, 1, 30) * 86400_000;
 const jobsById = new Map();
 const rateLimits = new Map();
 const loginAttempts = new Map();
@@ -294,7 +295,7 @@ async function processQueuedJob(jobId,imageSlotReserved=false){
     throw error;
   }
 }
-const queueConcurrency=Math.max(1,Math.min(8,Number(process.env.JOB_CONCURRENCY)||2));
+const queueConcurrency=boundedInteger('JOB_CONCURRENCY', 2, 1, 8);
 const jobQueue=await createJobQueue({redisUrl:process.env.REDIS_URL||'',concurrency:queueConcurrency,processJob:processQueuedJob,role:serviceRole});
 function schedulePump(){if(serviceRole==='worker'||pumpScheduled)return;pumpScheduled=true;setImmediate(()=>{pumpScheduled=false;void pumpQueue().catch(error=>console.error(JSON.stringify({component:'job-dispatcher',code:error.code||'DISPATCH_ERROR'})));});}
 async function pumpQueue(){
