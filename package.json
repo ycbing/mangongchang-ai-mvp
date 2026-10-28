@@ -10,7 +10,8 @@
     "start": "node server.mjs",
     "db:migrate": "node scripts/migrate-db.mjs",
     "db:import-sqlite": "node scripts/import-sqlite.mjs",
-    "assets:gc": "node scripts/gc-assets.mjs"
+    "assets:gc": "node scripts/gc-assets.mjs",
+    "backup:postgres": "node scripts/backup-postgres.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1157.0",
