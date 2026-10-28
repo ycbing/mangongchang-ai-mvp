@@ -51,8 +51,76 @@ async function generateStory(){snapshot();const w=work(),character=db.characters
 async function cancelActiveJob(){if(!activeJobId)return;await fetch('/api/v1/jobs/'+activeJobId+'/cancel',{method:'POST'});toast('已请求取消任务')}
 function makePrompt(w,p){const c=w.characterSnapshot||db.characters.find(x=>x.id===w.characterId);return [c?`角色外观锚点（不可修改）：${c.look||c.summary}`:'',c?`固定画风：${c.style||''}`:'','场景：'+p.scene,'动作表情：'+p.action,'镜头：'+p.camera,'画面氛围：'+p.tone,p.imagePrompt||'','负向要求：'+(p.negativePrompt||'文字、乱码、水印、签名、错误服装、多余肢体'),'画面中不得出现文字、对白、字幕、水印或标识。'].filter(Boolean).join('；')}
 async function generateAllImages(){const initial=work(),button=$('#generate-all'),ids=initial.panels.map(p=>p.id),prompts=Object.fromEntries(initial.panels.map(p=>[p.id,makePrompt(initial,p)]));button.disabled=true;button.textContent='正在排队…';try{const r=await fetch('/api/v1/jobs',{method:'POST',headers:{'content-type':'application/json','idempotency-key':'batch-'+initial.id+'-'+Date.now()},body:JSON.stringify({type:'batch_image',input:{workId:initial.id,panelIds:ids,prompts}})});if(!r.ok)throw new Error((await r.json()).error?.message||'批量任务提交失败');const batch=await r.json();let done=0;for(const item of batch.items){let job=item;for(let t=0;t<720&&!['succeeded','failed','cancelled'].includes(job.status);t++){await new Promise(resolve=>setTimeout(resolve,1000));const poll=await fetch('/api/v1/jobs/'+item.id);if(!poll.ok)break;job=await poll.json()}done++;button.textContent=`批量生成 ${done}/${batch.items.length}`;const latest=await fetch('/api/v1/state').then(r=>r.json());if(latest?.state){db=latest.state;serverRevision=latest.revision||serverRevision}const panel=work().panels.find(p=>p.id===item.input.panelId);if(panel&&job.status!=='succeeded')panel.generationStatus=job.status==='cancelled'?'cancelled':'failed';persist();renderPanelListOnly()}renderWorkbench();toast(`批量任务结束：${done} 格已处理`)}catch(e){toast(e.message||'批量生成失败')}finally{button.disabled=false;button.textContent='逐格批量生成'}}
+function validateBackupData(parsed){
+  const isRecord=value=>!!value&&typeof value==='object'&&!Array.isArray(value);
+  const fail=message=>{throw new Error(message)};
+  if(!isRecord(parsed))fail('备份文件格式不正确');
+  if(parsed.format!==undefined&&(parsed.format!=='mangongchang-ai-backup'||parsed.schemaVersion!==1))fail('备份格式或版本不受支持');
+  const data=parsed.format?parsed.data:parsed;
+  if(!isRecord(data)||!Array.isArray(data.works)||!Array.isArray(data.characters))fail('备份文件缺少作品或角色列表');
+  if(data.works.length>2000||data.characters.length>2000)fail('作品或角色数量超过导入上限');
+  const validId=value=>typeof value==='string'&&/^[A-Za-z0-9._:-]{1,160}$/.test(value);
+  const safeImage=value=>typeof value==='string'&&value.length<=20_000_000&&(!value||/^\/assets\/[A-Za-z0-9-]+\.(?:png|jpg|webp)$/i.test(value)||/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(value));
+  const ids=new Set();
+  for(const character of data.characters){
+    if(!isRecord(character)||!validId(character.id)||ids.has(character.id)||typeof character.name!=='string'||!character.name.trim()||character.name.length>2000)fail('角色记录无效：名称或 ID 不正确');
+    ids.add(character.id);
+    for(const key of ['summary','look','style'])if(character[key]!==undefined&&(typeof character[key]!=='string'||character[key].length>100_000))fail(`角色“${character.name}”的${key}字段无效`);
+    if(character.tags!==undefined&&(!Array.isArray(character.tags)||character.tags.length>500||character.tags.some(tag=>typeof tag!=='string'||tag.length>1000)))fail(`角色“${character.name}”的标签无效`);
+    if(character.referenceAssetIds!==undefined&&(!Array.isArray(character.referenceAssetIds)||character.referenceAssetIds.length>1000||character.referenceAssetIds.some(id=>!validId(id))))fail(`角色“${character.name}”的参考图列表无效`);
+    if(character.referenceUrl!==undefined&&!safeImage(character.referenceUrl))fail(`角色“${character.name}”的参考图地址无效`);
+  }
+  const workIds=new Set();
+  for(const work of data.works){
+    if(!isRecord(work)||!validId(work.id)||workIds.has(work.id)||typeof work.title!=='string'||!work.title.trim()||work.title.length>2000||(work.premise!==undefined&&(typeof work.premise!=='string'||work.premise.length>100_000)))fail('作品记录无效：标题、主题或 ID 不正确');
+    workIds.add(work.id);
+    if(!Array.isArray(work.panels)||work.panels.length<1||work.panels.length>20)fail(`作品《${work.title}》必须包含 1–20 格`);
+    if(work.characterId!=null&&!validId(work.characterId))fail(`作品《${work.title}》的角色 ID 无效`);
+    if(work.characterId!=null&&!data.characters.some(character=>character.id===work.characterId))fail(`作品《${work.title}》引用的角色不在备份中`);
+    if(work.characterSnapshot!==undefined&&!isRecord(work.characterSnapshot))fail(`作品《${work.title}》的角色快照无效`);
+    if(work.settings!==undefined){const settings=work.settings;if(!isRecord(settings)||!['4/5','3/4','1/1'].includes(settings.ratio)||!Number.isInteger(settings.gutter)||settings.gutter<8||settings.gutter>32||typeof settings.bg!=='string'||!/^#[0-9a-f]{6}$/i.test(settings.bg))fail(`作品《${work.title}》的画布设置无效`)}
+    const panelIds=new Set();
+    for(const panel of work.panels){
+      if(!isRecord(panel)||!validId(panel.id)||panelIds.has(panel.id))fail(`作品《${work.title}》包含无效或重复的画格 ID`);
+      panelIds.add(panel.id);
+      for(const key of ['scene','action','camera','expression','dialogue','caption','sfx','imagePrompt','negativePrompt','tone'])if(panel[key]!==undefined&&(typeof panel[key]!=='string'||panel[key].length>100_000))fail(`作品《${work.title}》的画格文本无效`);
+      if(panel.versions!==undefined&&(!Array.isArray(panel.versions)||!panel.versions.length||panel.versions.length>1000||panel.versions.some(version=>!Number.isInteger(version)||version<1)||new Set(panel.versions).size!==panel.versions.length))fail(`作品《${work.title}》的版本列表无效`);
+      if(panel.version!==undefined&&(!Number.isInteger(panel.version)||panel.version<1))fail(`作品《${work.title}》的当前版本无效`);
+      if(!(panel.versions||[1]).includes(panel.version||1))fail(`作品《${work.title}》的当前版本不在版本列表中`);
+      if(panel.fit!==undefined&&!['cover','contain','stretch'].includes(panel.fit))fail(`作品《${work.title}》的图片适配方式无效`);
+      if(panel.imageVersions!==undefined&&(!Array.isArray(panel.imageVersions)||panel.imageVersions.length>1000||panel.imageVersions.some(image=>!isRecord(image)||!safeImage(image.url))))fail(`作品《${work.title}》的画格图片版本无效`);
+      if(panel.elements!==undefined&&(!Array.isArray(panel.elements)||panel.elements.length>100))fail(`作品《${work.title}》的画格元素数量无效`);
+      if(panel.focalPoint!==undefined&&(!isRecord(panel.focalPoint)||!['x','y'].every(key=>Number.isFinite(panel.focalPoint[key])&&panel.focalPoint[key]>=0&&panel.focalPoint[key]<=1)))fail(`作品《${work.title}》的画面焦点无效`);
+      for(const key of ['dialogueLayout','captionLayout'])if(panel[key]!==undefined&&(!isRecord(panel[key])||!['x','y','w','h'].every(field=>Number.isFinite(panel[key][field])&&panel[key][field]>=0&&panel[key][field]<=1)))fail(`作品《${work.title}》的文字布局无效`);
+    }
+  }
+  if(data.activeId!=null&&!validId(data.activeId))fail('当前作品 ID 无效');
+  const characters=data.characters.map(character=>({...character,summary:character.summary||'',look:character.look||'',style:character.style||'',tags:character.tags||[],referenceAssetIds:character.referenceAssetIds||[],referenceUrl:character.referenceUrl||''}));
+  const works=data.works.map(work=>({...work,premise:work.premise||'',settings:work.settings||{ratio:'4/5',gutter:16,bg:'#f6f4ed'},panels:work.panels.map((panel,index)=>({...panel,order:index,scene:panel.scene||'',action:panel.action||'',camera:panel.camera||'',expression:panel.expression||'',dialogue:panel.dialogue||'',caption:panel.caption||'',sfx:panel.sfx||'',imagePrompt:panel.imagePrompt||'',negativePrompt:panel.negativePrompt||'',tone:panel.tone||'hope',fit:panel.fit||'cover',versions:panel.versions||[1],version:panel.version||1,imageVersions:panel.imageVersions||[],focalPoint:panel.focalPoint||{x:.5,y:.5},elements:panel.elements||[]}))}));
+  return {schemaVersion:1,characters,works,activeId:data.activeId||null};
+}
 function exportJson(){const data=JSON.stringify({format:'mangongchang-ai-backup',schemaVersion:1,exportedAt:new Date().toISOString(),data:db},null,2),blob=new Blob([data],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='漫工厂AI-作品备份-'+new Date().toISOString().slice(0,10)+'.json';a.click();URL.revokeObjectURL(a.href)}
-async function importJson(file){try{if(file.size>20_000_000)throw new Error('备份文件不能超过 20 MB');const parsed=JSON.parse(await file.text()),data=parsed.data||parsed;if(!Array.isArray(data.works)||!Array.isArray(data.characters))throw new Error('备份文件格式不正确');if(!confirm(`将导入 ${data.works.length} 个作品和 ${data.characters.length} 个角色。当前同 ID 内容会被备份数据覆盖，继续吗？`))return;const chars=new Map(db.characters.map(c=>[c.id,c]));for(const c of data.characters)chars.set(c.id,c);const works=new Map(db.works.map(w=>[w.id,w]));for(const w of data.works)works.set(w.id,w);db={...db,...data,characters:[...chars.values()],works:[...works.values()]};persist();renderNav();toast('备份已导入')}catch(e){toast(e.message||'导入失败')}}
+async function importJson(file){
+  try{
+    if(file.size>20_000_000)throw new Error('备份文件不能超过 20 MB');
+    const data=validateBackupData(JSON.parse(await file.text()));
+    const replacedCharacters=data.characters.filter(character=>db.characters.some(existing=>existing.id===character.id)).length;
+    const replacedWorks=data.works.filter(work=>db.works.some(existing=>existing.id===work.id)).length;
+    const imageCount=data.characters.filter(character=>character.referenceUrl||character.referenceAssetIds.length).length+data.works.reduce((sum,work)=>sum+work.panels.filter(panel=>panel.imageVersions.length).length,0);
+    const imageNote=imageCount?'\n\nJSON 不包含图片文件；在其他环境导入时，部分图片可能需要重新上传。':'';
+    const overwriteNote=replacedWorks||replacedCharacters?`\n其中 ${replacedWorks} 个同 ID 作品、${replacedCharacters} 个同 ID 角色将被覆盖。`:'';
+    if(!confirm(`将导入 ${data.works.length} 个作品和 ${data.characters.length} 个角色。${overwriteNote}${imageNote}\n\n继续吗？`))return;
+    const characters=new Map(db.characters.map(character=>[character.id,character]));
+    for(const character of data.characters)characters.set(character.id,character);
+    const works=new Map(db.works.map(work=>[work.id,work]));
+    for(const importedWork of data.works)works.set(importedWork.id,importedWork);
+    const importedActive=data.activeId&&works.has(data.activeId)?data.activeId:db.activeId;
+    db={...db,schemaVersion:1,characters:[...characters.values()],works:[...works.values()],activeId:works.has(importedActive)?importedActive:works.keys().next().value||null};
+    persist();
+    renderNav();
+    toast('备份已导入');
+  }catch(error){toast(error.message||'导入失败')}
+}
 function reorderPanel(from,to){const w=work();if(from===to||from<0||to<0||from>=w.panels.length||to>=w.panels.length)return;snapshot();const [panel]=w.panels.splice(from,1);w.panels.splice(to,0,panel);current=to;w.panels.forEach((p,i)=>p.order=i);w.updatedAt=Date.now();persist();renderWorkbench()}
 function exportDialog(){const w=work();modalOpen(`<h2>导出公众号长图</h2><p>超出单张高度上限时，会按画格边界拆成多张 PNG。</p><div class="field"><label>图片宽度</label><select id="export-width"><option value="750">750 px</option><option value="900" selected>900 px</option><option value="1080">1080 px</option></select></div><div class="field"><label>单张最大高度</label><select id="export-max-height"><option value="8000">8000 px</option><option value="12000" selected>12000 px</option><option value="20000">20000 px</option></select></div><div class="field"><label>格间距</label><input id="export-gutter" type="number" min="0" max="100" value="${w.settings.gutter}"></div><div class="modal-actions"><button class="secondary" id="export-cancel">取消</button><button class="primary" id="export-confirm">生成 PNG</button></div>`);$('#export-cancel').onclick=modalClose;$('#export-confirm').onclick=()=>{const width=+$('#export-width').value,maxHeight=+$('#export-max-height').value,gutter=Math.max(0,Math.min(100,+$('#export-gutter').value||0));modalClose();exportLong(width,maxHeight,gutter).catch(error=>toast(error.message||'长图导出失败，请重试'))}}
 function canvasTextLines(ctx,value,maxWidth,maxLines=12){const lines=[];for(const paragraph of String(value).split(/\r?\n/)){let line='';for(const char of paragraph){const next=line+char;if(line&&ctx.measureText(next).width>maxWidth){lines.push(line);line=char}else line=next}lines.push(line)}if(lines.length>maxLines){lines.length=maxLines;let last=lines[maxLines-1];while(last&&ctx.measureText(last+'…').width>maxWidth)last=last.slice(0,-1);lines[maxLines-1]=last+'…'}return lines}
