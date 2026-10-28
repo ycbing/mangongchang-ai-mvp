@@ -89,7 +89,7 @@ Compose 会先等待 PostgreSQL 和 Redis 健康，再启动 Web 服务并自动
 
 ### S3 兼容图片存储
 
-设置 `S3_BUCKET` 可将角色参考图和生成图片写入 S3；留空时应用继续使用 `LOCAL_STORAGE_DIR`。可配置 `S3_ENDPOINT`（MinIO 等兼容服务）、`S3_REGION`、`S3_ACCESS_KEY_ID`、`S3_SECRET_ACCESS_KEY` 和 `S3_FORCE_PATH_STYLE`。若运行环境支持 IAM/默认凭证链，可省略访问密钥；提供自定义端点时，非本机地址必须使用 HTTPS。应用启动会检查 bucket 访问权限，健康接口会返回实际图片存储类型。数据库迁移脚本会按当前存储配置迁移并校验图片对象。
+设置 `S3_BUCKET` 可将角色参考图和生成图片写入 S3；留空时应用继续使用 `LOCAL_STORAGE_DIR`。可配置 `S3_ENDPOINT`（MinIO 等兼容服务）、`S3_REGION`、`S3_ACCESS_KEY_ID`、`S3_SECRET_ACCESS_KEY` 和 `S3_FORCE_PATH_STYLE`。若运行环境支持 IAM/默认凭证链，可省略访问密钥；提供自定义端点时，非本机地址必须使用 HTTPS。应用启动会检查 bucket 访问权限，健康接口会返回实际图片存储类型。上传对象会保存 SHA-256 元数据，下载时对带校验元数据的对象重新计算并核验；元数据格式无效或校验不匹配会使读取失败。历史上未带校验元数据的对象仍可读取。数据库迁移脚本会按当前存储配置迁移并校验图片对象。
 
 资源清理默认只做预览：`npm run assets:gc` 会列出当前作品/角色没有引用且超过 30 天的资源数量、总大小，以及每项资源的存储键、资源 ID、字节数和保存天数，不会删除文件。确认清单并备份后，再运行 `npm run assets:gc -- --apply` 执行删除；执行时也会逐项记录已删除资源。可用 `--grace-days=60` 延长保留期（范围 7–365 天）。清理依据是当前数据库快照；JSON 备份不包含图片二进制，若要日后导入旧备份，请先保留对应图片资源。
 

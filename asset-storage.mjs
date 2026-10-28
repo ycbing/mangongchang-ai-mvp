@@ -8,7 +8,7 @@ function validKey(key) {
   return value;
 }
 
-export async function openAssetStorage({ directory }) {
+export async function openAssetStorage({ directory, s3Sdk: suppliedS3Sdk } = {}) {
   const bucket = process.env.S3_BUCKET || '';
   if (!bucket) {
     const root = resolve(directory);
@@ -31,7 +31,7 @@ export async function openAssetStorage({ directory }) {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('S3_ENDPOINT 必须是无账号信息的 HTTP 或 HTTPS 地址');
     if (url.protocol !== 'https:' && process.env.NODE_ENV === 'production' && !['localhost','127.0.0.1','::1','[::1]'].includes(url.hostname)) throw new Error('生产环境的远程 S3_ENDPOINT 必须使用 HTTPS');
   }
-  const { S3Client, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = await import('@aws-sdk/client-s3');
+  const { S3Client, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = suppliedS3Sdk || await import('@aws-sdk/client-s3');
   const credentials = process.env.S3_ACCESS_KEY_ID ? { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY } : undefined;
   const client = new S3Client({ region, endpoint, forcePathStyle: process.env.S3_FORCE_PATH_STYLE === 'true', credentials });
   await client.send(new HeadBucketCommand({ Bucket: bucket }));
@@ -46,7 +46,10 @@ export async function openAssetStorage({ directory }) {
       if (Number(result.ContentLength || 0) > maxBytes) throw new Error('资源文件超过读取限制');
       const chunks = []; let total = 0;
       for await (const chunk of result.Body) { const bytes = Buffer.from(chunk); total += bytes.byteLength; if (total > maxBytes) throw new Error('资源文件超过读取限制'); chunks.push(bytes); }
-      return Buffer.concat(chunks);
+      const bytes = Buffer.concat(chunks), expected = result.Metadata?.sha256;
+      if (expected && (typeof expected !== 'string' || !/^[a-f0-9]{64}$/i.test(expected))) throw Object.assign(new Error('S3 图片校验元数据无效'), { code: 'OBJECT_CHECKSUM_INVALID' });
+      if (expected && createHash('sha256').update(bytes).digest('hex') !== expected.toLowerCase()) throw Object.assign(new Error('S3 图片 SHA-256 校验失败'), { code: 'OBJECT_CHECKSUM_MISMATCH' });
+      return bytes;
     },
     async inspect(key) {
       try { const result = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: validKey(key) })); return { exists: true, checksum: result.Metadata?.sha256 || null }; }
