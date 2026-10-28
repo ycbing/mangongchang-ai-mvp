@@ -11,6 +11,20 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const accessPassword = 'test-only-production-password-32-chars';
 
+test('production server refuses to start without PostgreSQL configuration', async () => {
+  const child = spawn(process.execPath, ['server.mjs'], {
+    cwd: root,
+    env: { ...process.env, NODE_ENV: 'production', AUTH_PASSWORD: accessPassword, DATABASE_URL: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
+  child.stderr.setEncoding('utf8').on('data', chunk => { output += chunk; });
+  const [code] = await once(child, 'exit');
+  assert.equal(code, 1);
+  assert.match(output, /DATABASE_URL is required in production/);
+});
+
 async function freePort() {
   const server = createServer();
   await new Promise((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve));
@@ -19,7 +33,7 @@ async function freePort() {
   return port;
 }
 
-test('production auth enforces same-origin writes and emits secure session cookies', async () => {
+test('auth enforces same-origin writes and emits secure session cookies when requested', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'mangongchang-auth-'));
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -28,7 +42,8 @@ test('production auth enforces same-origin writes and emits secure session cooki
     cwd: root,
     env: {
       ...process.env,
-      NODE_ENV: 'production',
+      NODE_ENV: 'test',
+      AUTH_COOKIE_SECURE: 'true',
       AUTH_PASSWORD: accessPassword,
       DATABASE_URL: '',
       DATABASE_PATH: join(directory, 'test.sqlite'),

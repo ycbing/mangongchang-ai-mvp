@@ -10,7 +10,7 @@ import { validateCanvasSettings, validateCharacterInput } from './validation.mjs
 import { mutateSnapshot, persistSnapshot } from './state-store.mjs';
 import { createCompletedExport, listWorkExports } from './export-store.mjs';
 import { normalizeExportOptions, renderComicExports } from './export-renderer.mjs';
-import { boundedInteger, validateProductionAuth } from './runtime-config.mjs';
+import { boundedInteger, validateProductionAuth, validateProductionDatabase } from './runtime-config.mjs';
 import { verifyImage } from './image-validation.mjs';
 import { safeImageFetch } from './safe-image-fetch.mjs';
 import { syncDatabaseProjection } from './projection-store.mjs';
@@ -41,6 +41,7 @@ const maxImageBytes = boundedInteger('MAX_IMAGE_UPLOAD_MB', 10, 1, 100) * 1_000_
 const ownerId = 'local-owner';
 const authPassword = process.env.AUTH_PASSWORD || '';
 validateProductionAuth(process.env);
+validateProductionDatabase(process.env);
 const authEnabled = authPassword.length > 0;
 const sessionMs = boundedInteger('AUTH_SESSION_DAYS', 7, 1, 30) * 86400_000;
 const jobsById = new Map();
@@ -339,9 +340,9 @@ const server=createServer(async(req,res)=>{
     if(path==='/api/v1/auth/login'&&req.method==='POST'){
       if(!authEnabled)return send(res,400,{error:{code:'AUTH_DISABLED',message:'当前未启用账号鉴权'},requestId});if(!sameOrigin(req))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});if(!allowLoginAttempt(req))return send(res,429,{error:{code:'LOGIN_RATE_LIMITED',message:'尝试次数过多，请 15 分钟后再试'},requestId},{'retry-after':'900'});
       const input=await bodyJson(req),provided=String(input.password||''),a=createHash('sha256').update(provided).digest(),b=createHash('sha256').update(authPassword).digest();if(!timingSafeEqual(a,b))return send(res,401,{error:{code:'INVALID_CREDENTIALS',message:'密码不正确'},requestId});loginAttempts.delete(req.socket.remoteAddress||'local');
-      const token=randomBytes(32).toString('base64url'),hash=createHash('sha256').update(token).digest('hex'),expires=Date.now()+sessionMs;await db.prepare('INSERT INTO sessions(token_hash,owner_id,expires_at,created_at) VALUES(?,?,?,?)').run(hash,ownerId,expires,Date.now());return send(res,200,{authenticated:true,expiresAt:expires},{'set-cookie':`mg_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${req.socket.encrypted||process.env.NODE_ENV==='production'?'; Secure':''}`});
+      const token=randomBytes(32).toString('base64url'),hash=createHash('sha256').update(token).digest('hex'),expires=Date.now()+sessionMs;await db.prepare('INSERT INTO sessions(token_hash,owner_id,expires_at,created_at) VALUES(?,?,?,?)').run(hash,ownerId,expires,Date.now());return send(res,200,{authenticated:true,expiresAt:expires},{'set-cookie':`mg_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(sessionMs/1000)}${req.socket.encrypted||process.env.NODE_ENV==='production'||process.env.AUTH_COOKIE_SECURE==='true'?'; Secure':''}`});
     }
-    if(path==='/api/v1/auth/logout'&&req.method==='POST'){if(authEnabled&&!sameOrigin(req))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});const token=sessionToken(req);if(token)await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(createHash('sha256').update(token).digest('hex'));return send(res,200,{loggedOut:true},{'set-cookie':`mg_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${req.socket.encrypted||process.env.NODE_ENV==='production'?'; Secure':''}`});}
+    if(path==='/api/v1/auth/logout'&&req.method==='POST'){if(authEnabled&&!sameOrigin(req))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});const token=sessionToken(req);if(token)await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(createHash('sha256').update(token).digest('hex'));return send(res,200,{loggedOut:true},{'set-cookie':`mg_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${req.socket.encrypted||process.env.NODE_ENV==='production'||process.env.AUTH_COOKIE_SECURE==='true'?'; Secure':''}`});}
     if(authEnabled&&path.startsWith('/api/v1/')&&!path.startsWith('/api/v1/auth/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&path.startsWith('/assets/')&&!(await isAuthenticated(req)))return send(res,401,{error:{code:'AUTH_REQUIRED',message:'请先登录'},requestId});
     if(authEnabled&&!sameOrigin(req)&&!['GET','HEAD','OPTIONS'].includes(req.method))return send(res,403,{error:{code:'ORIGIN_FORBIDDEN',message:'请求来源无效'},requestId});
