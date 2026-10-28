@@ -490,4 +490,11 @@ const server=createServer(async(req,res)=>{
   }catch(error){const status=error.status||500;console.error(JSON.stringify({requestId,code:error.code||'INTERNAL_ERROR',status}));return send(res,status,{error:{code:status===413?'PAYLOAD_TOO_LARGE':status===400?'BAD_JSON':error.code||'INTERNAL_ERROR',message:status>=500?'服务暂时不可用':error.message||'请求无效'},requestId});}finally{releaseStateOperation?.();}
 });
 if(serviceRole!=='worker')server.listen(port,host,()=>console.log(`漫工厂 AI 已启动：http://${host}:${port}`));
-for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ const cleanup=async()=>{try{if(queueRecoveryTimer)clearInterval(queueRecoveryTimer);if(staleJobRecoveryTimer)clearInterval(staleJobRecoveryTimer);await jobQueue.close();await db.close();await assetStorage.close();process.exit(0);}catch{process.exit(1);}};if(server.listening)server.close(cleanup);else void cleanup();setTimeout(()=>process.exit(1),10_000).unref(); });
+let shutdownStarted=false;
+for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{
+  if(shutdownStarted)return;
+  shutdownStarted=true;
+  const forceExit=setTimeout(()=>{server.closeAllConnections?.();process.exit(1);},10_000);
+  const cleanup=async()=>{try{clearTimeout(forceExit);if(queueRecoveryTimer)clearInterval(queueRecoveryTimer);if(staleJobRecoveryTimer)clearInterval(staleJobRecoveryTimer);await jobQueue.close();await db.close();await assetStorage.close();process.exit(0);}catch{clearTimeout(forceExit);process.exit(1);}};
+  if(server.listening){server.close(cleanup);server.closeIdleConnections?.();}else void cleanup();
+});
