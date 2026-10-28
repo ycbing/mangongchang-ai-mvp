@@ -77,7 +77,7 @@ Docker Compose 可选启用每日备份服务：`docker compose --profile backup
 
 ## Docker Compose 部署
 
-复制 `.env.example` 为 `.env`，然后为 `POSTGRES_PASSWORD`、`REDIS_PASSWORD` 和 `AUTH_PASSWORD` 分别设置高强度随机值（数据库和 Redis 密码建议使用字母数字，确保连接串安全）。启动命令：
+复制 `.env.example` 为 `.env`，然后为 `POSTGRES_PASSWORD`、`REDIS_PASSWORD` 和 `AUTH_PASSWORD` 分别设置高强度随机值（数据库和 Redis 密码建议使用字母数字，确保连接串安全）。启用账号鉴权后，登录和所有写请求都必须带同源 Origin 或 Referer；无来源头、跨源来源都会被拒绝。启动命令：
 
 ```sh
 docker compose up --build -d
