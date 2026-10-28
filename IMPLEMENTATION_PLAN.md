@@ -80,6 +80,7 @@
 - [x] 进程内队列保持本地无 Redis 可用；Docker Compose 默认配置持久化 Redis 与 noeviction。
 - [x] 增加独立 `SERVICE_ROLE=web|worker`；Compose 分别运行 Web 与 BullMQ worker，worker 通过 revision 安全地合并画格结果。
 - [x] 使用真实临时 PostgreSQL 实例验证 Web/worker 并发状态变更都保留、revision 单调递增、过期 revision 被拒绝。
+- [x] 增加持久化任务心跳；恢复器按最近心跳回收失联运行任务，兼容旧的无心跳记录，并仅在取消任务心跳过期后收敛为 cancelled；SQLite HTTP 长图闭环与真实 PostgreSQL migration 003/任务恢复均已验证。
 - [ ] 在真实 Redis/Docker 环境验证 BullMQ 中断恢复、worker 租约恢复与 Compose 多服务启动。
 
 ### 8. PostgreSQL 备份与恢复

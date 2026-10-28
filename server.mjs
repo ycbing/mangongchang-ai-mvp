@@ -14,6 +14,7 @@ import { boundedInteger } from './runtime-config.mjs';
 import { verifyImage } from './image-validation.mjs';
 import { safeImageFetch } from './safe-image-fetch.mjs';
 import { syncDatabaseProjection } from './projection-store.mjs';
+import { heartbeatRunningJob, recoverExpiredJobs } from './job-lease.mjs';
 import { extname, join, normalize, resolve, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -69,7 +70,7 @@ CREATE INDEX IF NOT EXISTS works_owner_archived_updated ON works(owner_id,archiv
 CREATE TABLE IF NOT EXISTS work_characters(work_id TEXT NOT NULL, character_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, PRIMARY KEY(work_id,character_id));
 CREATE TABLE IF NOT EXISTS panels(id TEXT NOT NULL, work_id TEXT NOT NULL, order_index INTEGER NOT NULL, storyboard_json TEXT NOT NULL, layout_json TEXT NOT NULL, current_image_asset_id TEXT, generation_status TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(work_id,id), UNIQUE(work_id,order_index));
 CREATE TABLE IF NOT EXISTS state_history(revision INTEGER PRIMARY KEY, snapshot TEXT NOT NULL, created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL, input_json TEXT NOT NULL, result_json TEXT, error_json TEXT, idempotency_key TEXT, previous_job_id TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL, input_json TEXT NOT NULL, result_json TEXT, error_json TEXT, idempotency_key TEXT, previous_job_id TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, started_at INTEGER, heartbeat_at INTEGER, finished_at INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_owner_idempotency ON jobs(owner_id,idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS jobs_owner_status_created ON jobs(owner_id,status,created_at);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, owner_id TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL);
@@ -81,6 +82,9 @@ CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, 
   const existingPanelIdKey = existingPanelColumns.find(column => column.name === 'id');
   const existingPanelWorkKey = existingPanelColumns.find(column => column.name === 'work_id');
   if (existingPanelIdKey?.pk === 1 && !existingPanelWorkKey?.pk) await db.exec('DROP TABLE panels; CREATE TABLE panels(id TEXT NOT NULL, work_id TEXT NOT NULL, order_index INTEGER NOT NULL, storyboard_json TEXT NOT NULL, layout_json TEXT NOT NULL, current_image_asset_id TEXT, generation_status TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(work_id,id), UNIQUE(work_id,order_index));');
+  const existingJobColumns = await db.prepare('PRAGMA table_info(jobs)').all();
+  if (!existingJobColumns.some(column => column.name === 'heartbeat_at')) await db.exec('ALTER TABLE jobs ADD COLUMN heartbeat_at INTEGER');
+  await db.exec("CREATE INDEX IF NOT EXISTS jobs_owner_running_heartbeat ON jobs(owner_id,status,heartbeat_at) WHERE status IN ('running','cancel_requested')");
 }
 const assetStorage = await openAssetStorage({ directory: assetDir });
 function defaultState() {
@@ -239,6 +243,7 @@ function transientError(error){return error.name==='AbortError'||[429,500,502,50
 async function runJob(job){
   jobsById.set(job.id,{...job,controller:null});const controller=new AbortController();jobsById.get(job.id).controller=controller;
   const timeoutMs=job.type==='storyboard'?120000:180000;const timeout=setTimeout(()=>controller.abort(),timeoutMs),cancellationPoll=setInterval(()=>void getJob(job.id).then(current=>{if(current?.status==='cancel_requested')controller.abort()}).catch(()=>{}),1000);cancellationPoll.unref();
+  const heartbeatTimer=setInterval(()=>void heartbeatRunningJob(db,ownerId,job.id).catch(error=>console.error(JSON.stringify({component:'job-heartbeat',jobId:job.id,code:error.code||'HEARTBEAT_ERROR'}))),15_000);heartbeatTimer.unref();
   try {
     let result;
     for(let attempt=0;;attempt++){
@@ -262,10 +267,10 @@ async function runJob(job){
     else{job.status='failed';job.progress=0;job.error={code:error.name==='AbortError'?'PROVIDER_TIMEOUT':error.code||'PROVIDER_ERROR',message:error.name==='AbortError'?'模型任务已超时或取消':error.message||'任务失败',retryable:transientError(error)};}
     job.finishedAt=Date.now();await saveJob(job);
     if(job.type==='panel_image')await mutateStoredState(snapshot=>{const w=snapshot.works?.find(x=>x.id===job.input.workId),p=w?.panels?.find(x=>x.id===job.input.panelId);if(!p)return false;p.generationStatus=job.status;p.lastJobError=job.error?.message||null;w.updatedAt=Date.now();return true;});
-  } finally {clearTimeout(timeout);clearInterval(cancellationPoll);jobsById.delete(job.id);if(job.type==='panel_image'&&jobQueue?.kind==='in-process')runningImages--;schedulePump();}
+  } finally {clearTimeout(timeout);clearInterval(cancellationPoll);clearInterval(heartbeatTimer);jobsById.delete(job.id);if(job.type==='panel_image'&&jobQueue?.kind==='in-process')runningImages--;schedulePump();}
 }
 async function claimQueuedJob(jobId){
-  const row=await db.prepare("UPDATE jobs SET status='running',started_at=?,progress=5,attempts=attempts+1 WHERE id=? AND owner_id=? AND status='queued' RETURNING *").get(Date.now(),jobId,ownerId);
+  const now=Date.now(),row=await db.prepare("UPDATE jobs SET status='running',started_at=?,heartbeat_at=?,progress=5,attempts=attempts+1 WHERE id=? AND owner_id=? AND status='queued' RETURNING *").get(now,now,jobId,ownerId);
   return row?rowToJob(row):null;
 }
 async function processQueuedJob(jobId,imageSlotReserved=false){
@@ -275,7 +280,7 @@ async function processQueuedJob(jobId,imageSlotReserved=false){
   if(!job){if(imageSlotReserved)runningImages--;return;}
   try { await runJob(job); }
   catch(error){
-    await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL,progress=0 WHERE id=? AND owner_id=? AND status='running'").run(job.id,ownerId).catch(()=>{});
+    await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,heartbeat_at=NULL,finished_at=NULL,progress=0 WHERE id=? AND owner_id=? AND status='running'").run(job.id,ownerId).catch(()=>{});
     if(jobQueue.kind==='in-process')setTimeout(schedulePump,1500).unref();
     throw error;
   }
@@ -302,8 +307,8 @@ if(jobQueue.kind==='bullmq'&&serviceRole!=='worker'){
 if(serviceRole==='worker'){staleJobRecoveryTimer=setInterval(()=>void recoverStaleJobs().catch(error=>console.error(JSON.stringify({component:'job-recovery',code:error.code||'JOB_RECOVERY_ERROR'}))),30_000);staleJobRecoveryTimer.unref();}
 // Expire works after the documented 30-day soft-delete recovery window.
 if(serviceRole!=='worker'){const expiry=Date.now()-30*86400_000,previousCount=state.works.length;state.works=state.works.filter(w=>!w.deletedAt||w.deletedAt>expiry);if(state.works.length!==previousCount)await saveState(state);}
-if(serviceRole==='combined'){await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status='running'").run(ownerId);await db.prepare("UPDATE jobs SET status='cancelled',finished_at=? WHERE owner_id=? AND status='cancel_requested'").run(Date.now(),ownerId);}
-async function recoverStaleJobs(){const staleBefore=Date.now()-5*60_000;await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,finished_at=NULL WHERE owner_id=? AND status='running' AND started_at<?").run(ownerId,staleBefore);await db.prepare("UPDATE jobs SET status='cancelled',finished_at=? WHERE owner_id=? AND status='cancel_requested' AND started_at<?").run(Date.now(),ownerId,staleBefore);}
+if(serviceRole==='combined'){await db.prepare("UPDATE jobs SET status='queued',started_at=NULL,heartbeat_at=NULL,finished_at=NULL WHERE owner_id=? AND status='running'").run(ownerId);await db.prepare("UPDATE jobs SET status='cancelled',heartbeat_at=NULL,finished_at=? WHERE owner_id=? AND status='cancel_requested'").run(Date.now(),ownerId);}
+async function recoverStaleJobs(){const staleBefore=Date.now()-5*60_000;await recoverExpiredJobs(db,ownerId,staleBefore);}
 if(serviceRole==='worker')await recoverStaleJobs();
 if(serviceRole!=='worker'){await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(Date.now());schedulePump();}
 function safeConfig(){return {llm:{provider:configured('storyboard')?'connected':'mock',model:configured('storyboard')?providerConfig.llmModel:null},image:{provider:configured('panel_image')?'connected':'mock',model:configured('panel_image')?providerConfig.imageModel:null}};}
