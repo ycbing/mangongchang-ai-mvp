@@ -7,7 +7,7 @@ import { openAssetStorage } from './asset-storage.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { createProviderService } from './provider-service.mjs';
 import { insertJobsWithinLimit } from './job-admission.mjs';
-import { validateCanvasSettings, validateCharacterInput } from './validation.mjs';
+import { validateCanvasSettings, validateCharacterInput, validateStateSnapshot } from './validation.mjs';
 import { mutateSnapshot, persistSnapshot } from './state-store.mjs';
 import { createCompletedExport, listWorkExports } from './export-store.mjs';
 import { normalizeExportOptions, renderComicExports } from './export-renderer.mjs';
@@ -317,7 +317,7 @@ const server=createServer(async(req,res)=>{
     if(req.method==='GET'&&path==='/api/v1/config')return send(res,200,safeConfig());
     if(path==='/api/v1/state'&&req.method==='GET')return send(res,200,{state,revision});
     if(path==='/api/v1/state'&&req.method==='PUT'){
-      const next=await bodyJson(req);if(!next||!Array.isArray(next.works)||!Array.isArray(next.characters))return send(res,422,{error:{code:'VALIDATION_ERROR',message:'作品或角色数据结构无效'},requestId});
+      const next=validateStateSnapshot(await bodyJson(req));
       const result=await saveState(next,next.revision);if(result.conflict)return send(res,409,{error:{code:'REVISION_CONFLICT',message:'作品数据已在其他窗口更新'},revision:result.revision,state:result.snapshot,requestId});return send(res,200,{saved:true,revision:result.revision,updatedAt:Date.now()});
     }
     if(path==='/api/v1/works'&&req.method==='GET'){const q=(url.searchParams.get('q')||'').toLowerCase(),status=url.searchParams.get('status');return send(res,200,{items:state.works.filter(w=>!w.deletedAt&&(!q||`${w.title} ${w.premise}`.toLowerCase().includes(q))&&(!status||w.status===status)).sort((a,b)=>b.updatedAt-a.updatedAt)});}

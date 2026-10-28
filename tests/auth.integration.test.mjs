@@ -118,7 +118,7 @@ test('auth enforces same-origin writes and emits secure session cookies when req
 
     const state = await request('/api/v1/state', { headers: { cookie } });
     assert.equal(state.status, 200);
-    await state.arrayBuffer();
+    const initialState = await state.json();
 
     const crossOriginWrite = await request('/api/v1/state', {
       method: 'PUT',
@@ -127,6 +127,16 @@ test('auth enforces same-origin writes and emits secure session cookies when req
     });
     assert.equal(crossOriginWrite.status, 403);
     await crossOriginWrite.arrayBuffer();
+
+    const invalidStateWrite = await request('/api/v1/state', {
+      method: 'PUT',
+      headers: { cookie, origin: baseUrl, 'content-type': 'application/json' },
+      body: JSON.stringify({ works: [], characters: [], activeId: 'missing-work', revision: 1 }),
+    });
+    assert.equal(invalidStateWrite.status, 422);
+    assert.equal((await invalidStateWrite.json()).error.code, 'VALIDATION_ERROR');
+    const afterRejectedWrite = await request('/api/v1/state', { headers: { cookie } });
+    assert.equal((await afterRejectedWrite.json()).revision, initialState.revision);
 
     const logout = await request('/api/v1/auth/logout', {
       method: 'POST',
